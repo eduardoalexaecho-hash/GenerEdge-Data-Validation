@@ -1,10 +1,17 @@
 /**
  * =============================================================================
- * CRM READY COMPARISON TOOL
+ * CRM READY COMPARISON TOOL - ANY EMAIL/PHONE VERSION
  * =============================================================================
  * 
  * Compares "ZB & BP Validation" sheet with "CRM Ready" sheet to show which 
  * contacts were excluded and the specific reasons why they didn't meet the criteria.
+ * 
+ * UPDATED LOGIC:
+ * ==============
+ * - Checks ALL email columns (Primary Email, Email 1, Email 2, Personal Email)
+ * - Checks ALL phone columns (Contact Phone 1, Company Phone 1, Company Phone 2, Contact Mobile Phone)
+ * - Contact is valid if ANY email column is valid AND ANY phone column is valid
+ * - Phone doesn't need to be mobile - ANY valid phone type works
  * 
  * IMPORTANT - Column Name Differences:
  * ===================================
@@ -13,11 +20,11 @@
  *   - contact_phone1, company_phone1, company_phone2, contact_mobile_phone
  * 
  * ZB & BP Validation uses Title Case with spaces:
- *   - Organization, First Name, Last Name, Primary Email
+ *   - Organization, First Name, Last Name, Primary Email, Email 1, Email 2, Personal Email
  *   - Contact Phone 1, Company Phone 1, Company Phone 2, Contact Mobile Phone
  * 
  * The comparison matches:
- *   - CRM Ready "email" ↔ ZB & BP Validation "Primary Email"
+ *   - CRM Ready "email" ↔ ZB & BP Validation ANY email column (first found)
  *   - Composite key: organization|first_name|last_name|email (case-insensitive)
  * 
  * Note: State is NOT compared (doesn't exist in ZB & BP Validation)
@@ -25,11 +32,11 @@
  * Creates "Excluded Contacts" sheet with:
  * - All original data from ZB & BP Validation
  * - Exclusion reason
- * - Email validation status
- * - Phone validation statuses
+ * - ALL email validation statuses
+ * - ALL phone validation statuses
  * 
  * @author: Claude
- * @version: 2.0
+ * @version: 3.0 - ANY EMAIL/PHONE
  */
 
 // =============================================================================
@@ -229,12 +236,33 @@ function compareSheets(sourceSheet, includedContacts) {
   const firstNameIndex = headers.indexOf(COMPARISON_CONFIG.FIRST_NAME_COL);
   const lastNameIndex = headers.indexOf(COMPARISON_CONFIG.LAST_NAME_COL);
   
-  // Find email columns and their status columns
-  // Note: Using "Primary Email" from validation sheet, matches "email" in CRM Ready
-  const primaryEmailIndex = headers.indexOf(COMPARISON_CONFIG.PRIMARY_EMAIL_COL_VALIDATION);
-  const primaryEmailStatusIndex = headers.indexOf(COMPARISON_CONFIG.PRIMARY_EMAIL_COL_VALIDATION + COMPARISON_CONFIG.STATUS_SUFFIX);
+  // Find ALL email columns and their status columns
+  // Check: Primary Email, Email 1, Email 2, Personal Email
+  const emailColumns = [
+    {
+      name: COMPARISON_CONFIG.PRIMARY_EMAIL_COL_VALIDATION,
+      dataIndex: headers.indexOf(COMPARISON_CONFIG.PRIMARY_EMAIL_COL_VALIDATION),
+      statusIndex: headers.indexOf(COMPARISON_CONFIG.PRIMARY_EMAIL_COL_VALIDATION + COMPARISON_CONFIG.STATUS_SUFFIX)
+    },
+    {
+      name: COMPARISON_CONFIG.EMAIL_1_COL,
+      dataIndex: headers.indexOf(COMPARISON_CONFIG.EMAIL_1_COL),
+      statusIndex: headers.indexOf(COMPARISON_CONFIG.EMAIL_1_COL + COMPARISON_CONFIG.STATUS_SUFFIX)
+    },
+    {
+      name: COMPARISON_CONFIG.EMAIL_2_COL,
+      dataIndex: headers.indexOf(COMPARISON_CONFIG.EMAIL_2_COL),
+      statusIndex: headers.indexOf(COMPARISON_CONFIG.EMAIL_2_COL + COMPARISON_CONFIG.STATUS_SUFFIX)
+    },
+    {
+      name: COMPARISON_CONFIG.PERSONAL_EMAIL_COL,
+      dataIndex: headers.indexOf(COMPARISON_CONFIG.PERSONAL_EMAIL_COL),
+      statusIndex: headers.indexOf(COMPARISON_CONFIG.PERSONAL_EMAIL_COL + COMPARISON_CONFIG.STATUS_SUFFIX)
+    }
+  ].filter(col => col.dataIndex !== -1); // Only keep columns that exist
   
-  // Find phone columns and their validation columns
+  // Find ALL phone columns and their validation columns
+  // Check ANY phone type (not just mobile)
   const phoneColumns = [
     {
       name: COMPARISON_CONFIG.CONTACT_PHONE_1_COL,
@@ -260,7 +288,8 @@ function compareSheets(sourceSheet, includedContacts) {
       statusIndex: headers.indexOf(COMPARISON_CONFIG.CONTACT_MOBILE_COL + COMPARISON_CONFIG.STATUS_SUFFIX),
       lineTypeIndex: headers.indexOf(COMPARISON_CONFIG.CONTACT_MOBILE_COL + COMPARISON_CONFIG.LINE_TYPE_SUFFIX)
     }
-  ];
+  ].filter(col => col.dataIndex !== -1); // Only keep columns that exist
+  
   
   const excludedData = [];
   
@@ -268,38 +297,62 @@ function compareSheets(sourceSheet, includedContacts) {
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
     
-    // Create composite key
+    // Create composite key (use first email found for matching)
     const org = String(row[orgIndex] || '').trim().toLowerCase();
     const firstName = String(row[firstNameIndex] || '').trim().toLowerCase();
     const lastName = String(row[lastNameIndex] || '').trim().toLowerCase();
-    const email = String(row[primaryEmailIndex] || '').trim().toLowerCase();
-    const key = `${org}|${firstName}|${lastName}|${email}`;
+    
+    // Find first non-empty email for key (priority: Primary, Email 1, Email 2, Personal)
+    let emailForKey = '';
+    for (const emailCol of emailColumns) {
+      const emailValue = String(row[emailCol.dataIndex] || '').trim().toLowerCase();
+      if (emailValue) {
+        emailForKey = emailValue;
+        break;
+      }
+    }
+    
+    const key = `${org}|${firstName}|${lastName}|${emailForKey}`;
     
     // If not in CRM Ready, analyze why
     if (!includedContacts.has(key)) {
-      // Check Primary Email status
-      const primaryEmailStatus = String(row[primaryEmailStatusIndex] || '').toLowerCase().trim();
-      const hasValidEmail = (primaryEmailStatus === 'valid');
+      // Check ALL email columns for any valid email
+      let hasValidEmail = false;
+      const emailDetails = [];
       
-      // Check for valid mobile phones
-      let hasValidMobile = false;
+      for (const emailCol of emailColumns) {
+        const emailValue = row[emailCol.dataIndex];
+        const status = String(row[emailCol.statusIndex] || '').toLowerCase().trim();
+        
+        // Check if this email is valid
+        if (status === 'valid') {
+          hasValidEmail = true;
+        }
+        
+        // Store email details for display
+        if (emailValue && emailValue.toString().trim() !== '') {
+          emailDetails.push({
+            name: emailCol.name,
+            email: emailValue,
+            status: status || 'not validated'
+          });
+        }
+      }
+      
+      // Check ALL phone columns for any valid phone (not just mobile)
+      let hasValidPhone = false;
       const phoneDetails = [];
       
       for (const phoneCol of phoneColumns) {
-        if (phoneCol.dataIndex === -1) continue;
-        
         const phoneNumber = row[phoneCol.dataIndex];
         const status = String(row[phoneCol.statusIndex] || '').toLowerCase().trim();
         const lineType = String(row[phoneCol.lineTypeIndex] || '').toLowerCase().trim();
         
-        // Check if this is a valid mobile
-        const isValidMobile = (
-          (status === 'valid_confirmed' || status === 'valid confirmed') &&
-          (lineType === 'mobile')
-        );
+        // Check if this is ANY valid phone (not just mobile)
+        const isValidPhone = (status === 'valid_confirmed' || status === 'valid confirmed');
         
-        if (isValidMobile) {
-          hasValidMobile = true;
+        if (isValidPhone) {
+          hasValidPhone = true;
         }
         
         // Store phone details for display
@@ -313,25 +366,42 @@ function compareSheets(sourceSheet, includedContacts) {
         }
       }
       
-      // Determine exclusion reason
+      // CRITICAL FIX: If contact has BOTH valid email AND valid phone, 
+      // they should be in CRM Ready. Don't exclude them - this is likely 
+      // a key mismatch issue (different email was used in key creation)
+      if (hasValidEmail && hasValidPhone) {
+        Logger.log(`WARNING: Row ${i + 1} has valid email AND phone but not in CRM Ready - possible key mismatch. Skipping exclusion.`);
+        continue;  // Skip this contact - don't add to excluded list
+      }
+      
+      // Determine exclusion reason (only for contacts missing email OR phone)
       let reason = '';
-      if (!hasValidEmail && !hasValidMobile) {
-        reason = 'Missing Primary Email AND mobile phone';
+      if (!hasValidEmail && !hasValidPhone) {
+        reason = 'No valid email AND no valid phone';
       } else if (!hasValidEmail) {
-        reason = 'Primary Email not valid';
-      } else if (!hasValidMobile) {
-        reason = 'No valid mobile phone';
+        reason = 'No valid email in any column';
+      } else if (!hasValidPhone) {
+        reason = 'No valid phone in any column';
+      }
+      
+      // Get email status summary for display
+      let emailStatusSummary = '';
+      if (emailDetails.length > 0) {
+        emailStatusSummary = emailDetails.map(e => 
+          `${e.name}: ${e.status}`
+        ).join('; ');
       } else {
-        reason = 'Unknown reason (check validation)';
+        emailStatusSummary = 'No emails';
       }
       
       excludedData.push({
         rowNumber: i + 1,
         rowData: row,
         reason: reason,
-        emailStatus: primaryEmailStatus || 'not validated',
+        emailStatus: emailStatusSummary,
+        emailDetails: emailDetails,
         hasValidEmail: hasValidEmail,
-        hasValidMobile: hasValidMobile,
+        hasValidPhone: hasValidPhone,
         phoneDetails: phoneDetails
       });
     }
@@ -361,11 +431,11 @@ function createExcludedSheet(spreadsheet, sourceSheet, excludedData) {
   // Get source headers
   const sourceHeaders = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
   
-  // Build headers: Original Row + Exclusion Reason + original data + Phone Details
+  // Build headers: Original Row + Exclusion Reason + Email Statuses + original data + Phone Details
   const headers = [
     'Original Row #',
     'Exclusion Reason',
-    'Primary Email Status',
+    'Email Validation Statuses',
     ...sourceHeaders,
     'Phone Validation Details'
   ];
@@ -459,16 +529,16 @@ function showComparisonInfo() {
     <ul>
       <li><strong>Original Row #:</strong> Row number in ${COMPARISON_CONFIG.SOURCE_SHEET}</li>
       <li><strong>Exclusion Reason:</strong> Why contact was excluded</li>
-      <li><strong>Email Status:</strong> Primary Email validation status</li>
+      <li><strong>Email Statuses:</strong> Validation status of ALL email columns</li>
       <li><strong>All Original Data:</strong> Complete contact information</li>
       <li><strong>Phone Details:</strong> All phone validation results</li>
     </ul>
     
     <h4>Exclusion Reasons:</h4>
     <ul>
-      <li>Missing Primary Email AND mobile phone</li>
-      <li>Primary Email not valid</li>
-      <li>No valid mobile phone</li>
+      <li>No valid email AND no valid phone</li>
+      <li>No valid email in any column (Primary, Email 1, Email 2, Personal)</li>
+      <li>No valid phone in any column (any phone type, not just mobile)</li>
     </ul>
     
     <h4>How to Use:</h4>
