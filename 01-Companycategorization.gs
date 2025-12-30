@@ -1,6 +1,11 @@
 /**
- * HOME BUILDER CATEGORIZATION SYSTEM - V7.0
+ * HOME BUILDER CATEGORIZATION SYSTEM - V7.1
  * ==========================================
+ * IMPROVEMENTS IN V7.1:
+ * - Dynamic output columns: Only includes columns that exist in source sheet
+ * - No more empty/blank columns in output (Contact Full Name, etc.)
+ * - Cleaner output sheets with only relevant data
+ * 
  * IMPROVEMENTS IN V7.0:
  * - Works on the ACTIVE spreadsheet (no hardcoded ID)
  * - Integrated with unified menu system
@@ -16,7 +21,7 @@
  * 3. No Description
  * 
  * @author: Claude
- * @version: 7.0 - Works on active spreadsheet
+ * @version: 7.1 - Dynamic output columns (only includes columns that exist)
  */
 
 // ============================================================================
@@ -43,24 +48,8 @@ const CATEGORIZATION_CONFIG = {
     city: 'Company City'
   },
   
-  // Output columns (in order) - all columns from cleaned data
-  OUTPUT_COLUMNS: [
-    'Contact Full Name',
-    'First Name',
-    'Last Name',
-    'Organization',
-    'Primary Email',
-    'Email 1',
-    'Email 2',
-    'Personal Email',
-    'Contact Phone 1',
-    'Company Phone 1',
-    'Company Phone 2',
-    'Contact Mobile Phone',
-    'Company Description',
-    'Website',
-    'Company City'
-  ],
+  // Output columns will be built dynamically from source sheet
+  // Only columns that exist in source will be included in output
   
   // Starting row
   FIRST_DATA_ROW: 2,
@@ -519,8 +508,34 @@ function isPlaceholderSiteCat(description) {
 function createCategorySheetsV7(spreadsheet, sourceSheet, results, columnMap) {
   const sourceHeaders = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
   
-  // Build output headers
-  const outputHeaders = CATEGORIZATION_CONFIG.OUTPUT_COLUMNS.concat([
+  // Build output columns dynamically - only include columns that exist in source
+  const possibleColumns = [
+    'Contact Full Name',
+    'First Name',
+    'Last Name',
+    'Organization',
+    'Primary Email',
+    'Email 1',
+    'Email 2',
+    'Personal Email',
+    'Contact Phone 1',
+    'Company Phone 1',
+    'Company Phone 2',
+    'Contact Mobile Phone',
+    'Company Description',
+    'Website',
+    'Company City'
+  ];
+  
+  // Only keep columns that exist in source headers
+  const outputColumns = possibleColumns.filter(colName => {
+    return sourceHeaders.some(header => 
+      header.toLowerCase().trim() === colName.toLowerCase().trim()
+    );
+  });
+  
+  // Build output headers with categorization columns
+  const outputHeaders = outputColumns.concat([
     'Category',
     'Confidence %',
     'Matched Keywords',
@@ -555,8 +570,8 @@ function createCategorySheetsV7(spreadsheet, sourceSheet, results, columnMap) {
     categoryStats[categoryNames[category]]++;
   });
   
-  // Get column indices
-  const outputColumnIndices = CATEGORIZATION_CONFIG.OUTPUT_COLUMNS.map(colName => {
+  // Get column indices for output columns (all should exist since we filtered)
+  const outputColumnIndices = outputColumns.map(colName => {
     return sourceHeaders.findIndex(h => 
       h.toLowerCase().trim() === colName.toLowerCase().trim()
     );
