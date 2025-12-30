@@ -3,21 +3,38 @@
  * DATA CLEANING PIPELINE V3 - Production-Ready Google Sheets Apps Script
  * =============================================================================
  * 
+ * VERSION 3.3 CRITICAL FIX:
+ * - FIXED: Duplicate detection was treating different people at same company as duplicates
+ * - ROOT CAUSE: When Contact Full Name had whitespace, it didn't check First+Last name
+ * - SOLUTION: Now checks if Contact Full Name is non-empty after trim, falls back to First+Last
+ * 
+ * EXAMPLE BUG (BEFORE FIX):
+ * - Marty Helgerson | Frase Construction | frase.com
+ * - Jeremy Frase | Frase Construction | frase.com
+ * ❌ Were marked as duplicates (Match: "Company + Website")
+ * ✅ Now correctly kept as separate contacts (Match: "Name + Company + Website")
+ * 
+ * VERSION 3.2 CRITICAL FIX:
+ * - FIXED: Duplicate detection now uses First Name + Last Name when Contact Full Name is empty
+ * - BEFORE: Would treat all contacts from same company as duplicates if no Contact Full Name
+ * - AFTER: Uses First + Last name to distinguish different people from same company
+ * 
  * VERSION 3 UPDATES (Critical Fix):
  * - Row-level duplicate detection: Uses COMPOSITE KEY (Name + Company + Website)
  * - Column-level deduplication: ONLY applies to Email and Phone columns
  * - Organization, Website, City, Description: NO duplicate removal (preserved as-is)
  * 
- * DUPLICATE DETECTION LOGIC:
- * - If Contact Full Name exists: Name + Company + Website
- * - If Contact Full Name missing: Company + Website
- * - Fallback to Description if needed
+ * DUPLICATE DETECTION LOGIC (UPDATED):
+ * - Priority 1: Contact Full Name + Company + Website (if Contact Full Name non-empty)
+ * - Priority 2: First Name + Last Name + Company + Website (if Contact Full Name empty)
+ * - Priority 3: First Name + Last Name + Company (no website)
+ * - Fallback: Company + Website (ONLY if NO name data at all)
  * 
- * Example - NOT duplicates (same name, different companies):
- * - David Gordon | Aspire Fine Homes | aspire.com
- * - David Gordon | Whitestone Builders | whitestone.com
+ * Example - NOT duplicates (different people, same company):
+ * - Marty Helgerson | Frase Construction | frase.com
+ * - Jeremy Frase | Frase Construction | frase.com  ← DIFFERENT PERSON, NOT DUPLICATE!
  * 
- * Example - ARE duplicates (all fields match):
+ * Example - ARE duplicates (same person, same company):
  * - David Gordon | Aspire Fine Homes | aspire.com
  * - David Gordon | Aspire Fine Homes | aspire.com  ← DUPLICATE ROW
  * 
@@ -25,15 +42,15 @@
  * - Company Name - Cleaned (CRITICAL - must exist)
  * 
  * OPTIONAL COLUMNS:
- * - Contact Full Name (if missing, First Name and Last Name won't be in output)
+ * - Contact Full Name, First Name, Last Name (at least one recommended)
  * - Website, Email columns, Phone columns, Company Description, Company City
  * 
  * OUTPUT BEHAVIOR:
  * - If Contact Full Name exists → Output includes: Contact Full Name, First Name, Last Name
- * - If Contact Full Name missing → Output does NOT include: Contact Full Name, First Name, Last Name
+ * - If Contact Full Name missing → Output includes: First Name, Last Name (if they exist)
  * 
  * @author: Claude
- * @version: 3.1 - First/Last Name only included if Contact Full Name exists
+ * @version: 3.3 - CRITICAL FIX: Different people at same company no longer treated as duplicates
  */
 
 // =============================================================================
@@ -369,6 +386,8 @@ function removeDuplicateRows(dataObject) {
   const { headers, columnMap, data } = dataObject;
   
   const fullNameIdx = columnMap[CONFIG.COLUMNS.FULL_NAME];
+  const firstNameIdx = columnMap[CONFIG.COLUMNS.FIRST_NAME];
+  const lastNameIdx = columnMap[CONFIG.COLUMNS.LAST_NAME];
   const companyNameIdx = columnMap[CONFIG.COLUMNS.ORGANIZATION];
   const websiteIdx = columnMap[CONFIG.COLUMNS.WEBSITE];
   const descriptionIdx = columnMap[CONFIG.COLUMNS.COMPANY_DESC];
@@ -378,14 +397,40 @@ function removeDuplicateRows(dataObject) {
   const duplicates = []; // Track duplicate information
   
   data.forEach((row, index) => {
-    // Handle missing Contact Full Name column
-    const fullName = fullNameIdx !== undefined ? row[fullNameIdx] : '';
+    // CRITICAL FIX: Build name from Contact Full Name OR First + Last Name
+    let nameForKey = '';
+    
+    // Priority 1: Use Contact Full Name if it exists and has NON-EMPTY value
+    if (fullNameIdx !== undefined && row[fullNameIdx]) {
+      const fullNameValue = row[fullNameIdx].toString().trim();
+      if (fullNameValue) {
+        // Contact Full Name has actual content
+        nameForKey = fullNameValue;
+      }
+    }
+    
+    // Priority 2: Use First Name + Last Name if nameForKey is still empty
+    // This runs if: (a) Contact Full Name column doesn't exist, OR
+    //               (b) Contact Full Name is empty/whitespace
+    if (!nameForKey && (firstNameIdx !== undefined || lastNameIdx !== undefined)) {
+      const firstName = firstNameIdx !== undefined ? (row[firstNameIdx] || '').toString().trim() : '';
+      const lastName = lastNameIdx !== undefined ? (row[lastNameIdx] || '').toString().trim() : '';
+      // Combine First + Last (with space if both exist)
+      if (firstName && lastName) {
+        nameForKey = `${firstName} ${lastName}`;
+      } else if (firstName) {
+        nameForKey = firstName;
+      } else if (lastName) {
+        nameForKey = lastName;
+      }
+    }
+    
     const companyName = row[companyNameIdx];
     const website = websiteIdx !== undefined ? row[websiteIdx] : '';
     const description = descriptionIdx !== undefined ? row[descriptionIdx] : '';
     
     // Normalize: trim and lowercase for comparison
-    const nameKey = fullName ? fullName.toString().trim().toLowerCase() : '';
+    const nameKey = nameForKey ? nameForKey.toLowerCase() : '';
     const companyKey = companyName ? companyName.toString().trim().toLowerCase() : '';
     const websiteKey = website ? website.toString().trim().toLowerCase() : '';
     const descriptionKey = description ? description.toString().trim().toLowerCase() : '';
@@ -398,8 +443,12 @@ function removeDuplicateRows(dataObject) {
       // Standard 3-field key (Name + Company + Website)
       compositeKey = `${nameKey}|${companyKey}|${websiteKey}`;
       matchCriteria = 'Name + Company + Website';
+    } else if (nameKey && companyKey) {
+      // Name + Company (no website available)
+      compositeKey = `${nameKey}|${companyKey}`;
+      matchCriteria = 'Name + Company';
     } else if (companyKey && websiteKey) {
-      // No name column: Company + Website
+      // No name available: Company + Website only
       compositeKey = `${companyKey}|${websiteKey}`;
       matchCriteria = 'Company + Website';
     } else if (companyKey && descriptionKey) {
@@ -422,7 +471,7 @@ function removeDuplicateRows(dataObject) {
       duplicates.push({
         duplicateRowNumber: index + 2, // +2 because: +1 for header, +1 for 1-based indexing
         originalRowNumber: originalRowNumber,
-        fullName: fullName,
+        fullName: nameForKey,  // Use the constructed name
         companyName: companyName,
         website: website,
         description: description,
@@ -1310,6 +1359,10 @@ function showLogs() {
     ui.ButtonSet.OK
   );
 }
+
+// =============================================================================
+// END OF SCRIPT V3
+// =============================================================================
 
 // =============================================================================
 // END OF SCRIPT V3
