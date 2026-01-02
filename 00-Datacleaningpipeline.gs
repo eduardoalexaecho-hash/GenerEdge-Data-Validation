@@ -3,6 +3,12 @@
  * DATA CLEANING PIPELINE V3 - Production-Ready Google Sheets Apps Script
  * =============================================================================
  * 
+ * VERSION 3.4 MENU UPDATE:
+ * - ADDED: Pipeline Dashboard integration in onOpen menu
+ * - NEW: 📊 View Pipeline Dashboard option at top of menu
+ * - Dashboard shows: cleaning stats, CRM Ready stats, categorization, overall conversion
+ * - REQUIRES: PipelineDashboard.gs file to be added separately
+ * 
  * VERSION 3.3 CRITICAL FIX:
  * - FIXED: Duplicate detection was treating different people at same company as duplicates
  * - ROOT CAUSE: When Contact Full Name had whitespace, it didn't check First+Last name
@@ -1301,8 +1307,12 @@ function onOpen() {
   // Create main menu with submenus
   ui.createMenu('🔧 Data Tools')
     
+    // Pipeline Dashboard - at top level for easy access
+    .addItem('📊 View Pipeline Dashboard', 'createPipelineDashboard')
+    .addSeparator()
+    
     // Data Cleanup submenu
-    .addSubMenu(ui.createMenu('📊 Data Cleanup')
+    .addSubMenu(ui.createMenu('🧹 Data Cleanup')
       .addItem('▶️ Run Pipeline V3', 'runDataCleaningPipelineV3')
       .addSeparator()
       .addItem('📋 View Logs', 'showLogs'))
@@ -1333,7 +1343,7 @@ function onOpen() {
       .addItem('⚙️ Configure Settings', 'showConfigDialog')
       .addItem('📋 View Validation Logs', 'showValidationLogs'))
     
-    // Filter by Criteria submenu (NEW!)
+    // CRM Ready submenu
     .addSubMenu(ui.createMenu('🎯 CRM Ready')
       .addItem('▶️ Create CRM Ready Sheet', 'createCRMReady')
       .addItem('📞 Generate CRM Callers Ready', 'generateCRMCallersReady')
