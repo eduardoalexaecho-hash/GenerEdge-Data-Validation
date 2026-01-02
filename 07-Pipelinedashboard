@@ -1,0 +1,503 @@
+/**
+ * =============================================================================
+ * DATA PIPELINE DASHBOARD - V4.0 (FINAL)
+ * =============================================================================
+ * 
+ * V4.0 CHANGES:
+ * - REORDERED: Sections now in order: Cleaning → Categorization → CRM Ready → Overall
+ * - COLORS: Only blue and white backgrounds (no green/yellow/red)
+ * - FIXED: Home Builders count matches ZB & BP Validation (same tab, renamed)
+ * - CLEAN: Only section headers colored, no row colors
+ * 
+ * SECTION ORDER:
+ * 1. 🧹 DATA CLEANING STATISTICS
+ * 2. 🏠 COMPANY CATEGORIZATION STATISTICS
+ * 3. ✅ CRM READY STATISTICS
+ * 4. 🎯 OVERALL PIPELINE SUMMARY
+ * 
+ * NOTE: "ZB & BP Validation" and "Home Builders & Related" are the SAME tab.
+ * User workflow: Categorize → Find home builders → Rename to "ZB & BP Validation" → Validate
+ * Dashboard detects this and uses the same count for both.
+ * 
+ * @author: Claude
+ * @version: 4.0
+ */
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const DASHBOARD_CONFIG = {
+  DASHBOARD_SHEET_NAME: '📊 Pipeline Dashboard',
+  
+  // Sheet names to read from
+  SHEETS: {
+    ORIGINAL: 'Original Sheet',
+    CLEANED: 'Cleaned Data V3',
+    DUPLICATES: 'Duplicates Report',
+    ZB_BP_VALIDATION: 'ZB & BP Validation',
+    CRM_READY: 'CRM Ready',
+    EXCLUDED_CONTACTS: 'Excluded Contacts',
+    HOME_BUILDERS: 'Home Builders & Related',
+    OTHER_COMPANIES: 'Other Companies',
+    NO_DESCRIPTION: 'No Description'
+  },
+  
+  // Colors (Blue and White only)
+  COLORS: {
+    HEADER_BG: '#1a73e8',          // Blue
+    STAT_HEADER_BG: '#e8eaed',     // Light gray (for column headers)
+    WHITE: '#ffffff',
+    BLACK: '#000000'
+  }
+};
+
+// =============================================================================
+// MAIN FUNCTION
+// =============================================================================
+
+/**
+ * Creates or updates the pipeline dashboard
+ */
+function createPipelineDashboard() {
+  const startTime = new Date();
+  
+  try {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    
+    Logger.log('=== CREATING PIPELINE DASHBOARD V3 ===');
+    
+    // Collect statistics
+    const stats = collectPipelineStats(spreadsheet);
+    
+    // Create or update dashboard sheet
+    const dashboardSheet = createOrClearDashboard(spreadsheet);
+    
+    // Build dashboard
+    buildDashboard(dashboardSheet, stats);
+    
+    // Move to first position
+    spreadsheet.setActiveSheet(dashboardSheet);
+    spreadsheet.moveActiveSheet(1);
+    
+    const endTime = new Date();
+    const duration = ((endTime - startTime) / 1000).toFixed(1);
+    
+    Logger.log(`Dashboard created in ${duration} seconds`);
+    
+    SpreadsheetApp.getUi().alert(
+      '✅ Dashboard Created!',
+      `Pipeline Dashboard has been created/updated.\n\n` +
+      `Processing time: ${duration} seconds\n\n` +
+      `View the "📊 Pipeline Dashboard" tab for statistics.`,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    
+  } catch (error) {
+    Logger.log('ERROR creating dashboard: ' + error.toString());
+    SpreadsheetApp.getUi().alert(
+      '❌ Error',
+      'Failed to create dashboard: ' + error.toString(),
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    throw error;
+  }
+}
+
+// =============================================================================
+// DATA COLLECTION
+// =============================================================================
+
+/**
+ * Collects statistics from all pipeline sheets
+ */
+function collectPipelineStats(spreadsheet) {
+  const stats = {
+    cleaning: {},
+    crmReady: {},
+    categorization: {},
+    overall: {}
+  };
+  
+  // 1. DATA CLEANING STATS
+  const originalSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.ORIGINAL);
+  const cleanedSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.CLEANED);
+  
+  stats.cleaning.originalCount = originalSheet ? Math.max(0, originalSheet.getLastRow() - 1) : 0;
+  stats.cleaning.cleanedCount = cleanedSheet ? Math.max(0, cleanedSheet.getLastRow() - 1) : 0;
+  
+  stats.cleaning.originalMissing = !originalSheet;
+  stats.cleaning.cleanedMissing = !cleanedSheet;
+  
+  // CALCULATE removed count (accurate math)
+  stats.cleaning.duplicatesRemoved = stats.cleaning.originalCount - stats.cleaning.cleanedCount;
+  
+  // Calculate cleaning percentages
+  if (stats.cleaning.originalCount > 0) {
+    stats.cleaning.keptPercentage = (stats.cleaning.cleanedCount / stats.cleaning.originalCount);
+    stats.cleaning.removedPercentage = (stats.cleaning.duplicatesRemoved / stats.cleaning.originalCount);
+  } else {
+    stats.cleaning.keptPercentage = 0;
+    stats.cleaning.removedPercentage = 0;
+  }
+  
+  // 2. CRM READY STATS
+  const sourceSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.ZB_BP_VALIDATION) || 
+                      spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.CLEANED);
+  const crmReadySheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.CRM_READY);
+  
+  stats.crmReady.sourceCount = sourceSheet ? Math.max(0, sourceSheet.getLastRow() - 1) : 0;
+  stats.crmReady.sourceName = sourceSheet ? sourceSheet.getName() : 'Unknown';
+  stats.crmReady.crmReadyCount = crmReadySheet ? Math.max(0, crmReadySheet.getLastRow() - 1) : 0;
+  
+  // CALCULATE excluded count (accurate math)
+  stats.crmReady.excludedCount = stats.crmReady.sourceCount - stats.crmReady.crmReadyCount;
+  
+  stats.crmReady.sourceMissing = !sourceSheet;
+  stats.crmReady.crmReadyMissing = !crmReadySheet;
+  
+  // Calculate CRM Ready percentages
+  if (stats.crmReady.sourceCount > 0) {
+    stats.crmReady.includedPercentage = (stats.crmReady.crmReadyCount / stats.crmReady.sourceCount);
+    stats.crmReady.excludedPercentage = (stats.crmReady.excludedCount / stats.crmReady.sourceCount);
+  } else {
+    stats.crmReady.includedPercentage = 0;
+    stats.crmReady.excludedPercentage = 0;
+  }
+  
+  // 3. CATEGORIZATION STATS
+  // NOTE: "ZB & BP Validation" and "Home Builders & Related" are the SAME tab
+  // User renames "Home Builders & Related" to "ZB & BP Validation" before validating
+  // So if ZB & BP Validation exists, use that count for home builders
+  const homeBuildersSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.HOME_BUILDERS);
+  const otherCompaniesSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.OTHER_COMPANIES);
+  const noDescriptionSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.SHEETS.NO_DESCRIPTION);
+  
+  // If ZB & BP Validation exists, it IS the home builders tab (renamed)
+  if (sourceSheet && sourceSheet.getName() === DASHBOARD_CONFIG.SHEETS.ZB_BP_VALIDATION) {
+    stats.categorization.homeBuilders = stats.crmReady.sourceCount; // Same as ZB & BP Validation
+  } else {
+    stats.categorization.homeBuilders = homeBuildersSheet ? Math.max(0, homeBuildersSheet.getLastRow() - 1) : 0;
+  }
+  
+  stats.categorization.otherCompanies = otherCompaniesSheet ? Math.max(0, otherCompaniesSheet.getLastRow() - 1) : 0;
+  stats.categorization.noDescription = noDescriptionSheet ? Math.max(0, noDescriptionSheet.getLastRow() - 1) : 0;
+  
+  stats.categorization.total = stats.categorization.homeBuilders + 
+                                stats.categorization.otherCompanies + 
+                                stats.categorization.noDescription;
+  
+  stats.categorization.hasCategorization = stats.categorization.total > 0;
+  
+  // Calculate categorization percentages
+  if (stats.categorization.total > 0) {
+    stats.categorization.homeBuildersPercentage = (stats.categorization.homeBuilders / stats.categorization.total);
+    stats.categorization.otherCompaniesPercentage = (stats.categorization.otherCompanies / stats.categorization.total);
+    stats.categorization.noDescriptionPercentage = (stats.categorization.noDescription / stats.categorization.total);
+  } else {
+    stats.categorization.homeBuildersPercentage = 0;
+    stats.categorization.otherCompaniesPercentage = 0;
+    stats.categorization.noDescriptionPercentage = 0;
+  }
+  
+  // 4. OVERALL PIPELINE STATS
+  stats.overall.startCount = stats.cleaning.originalCount;
+  stats.overall.endCount = stats.crmReady.crmReadyCount;
+  
+  // CRITICAL: Original → CRM Ready conversion
+  if (stats.overall.startCount > 0) {
+    stats.overall.conversionRate = (stats.overall.endCount / stats.overall.startCount);
+  } else {
+    stats.overall.conversionRate = 0;
+  }
+  
+  return stats;
+}
+
+// =============================================================================
+// DASHBOARD CREATION
+// =============================================================================
+
+/**
+ * Creates or clears the dashboard sheet
+ */
+function createOrClearDashboard(spreadsheet) {
+  let dashboardSheet = spreadsheet.getSheetByName(DASHBOARD_CONFIG.DASHBOARD_SHEET_NAME);
+  
+  if (dashboardSheet) {
+    dashboardSheet.clear();
+    dashboardSheet.clearFormats();
+    Logger.log('Cleared existing dashboard sheet');
+  } else {
+    dashboardSheet = spreadsheet.insertSheet(DASHBOARD_CONFIG.DASHBOARD_SHEET_NAME);
+    Logger.log('Created new dashboard sheet');
+  }
+  
+  return dashboardSheet;
+}
+
+/**
+ * Builds the complete dashboard with all sections
+ */
+function buildDashboard(sheet, stats) {
+  let currentRow = 1;
+  
+  // Main header
+  currentRow = addMainHeader(sheet, currentRow);
+  currentRow += 2; // 2 blank rows
+  
+  // Section 1: Data Cleaning Stats
+  currentRow = addCleaningStatsSection(sheet, currentRow, stats.cleaning);
+  currentRow += 2; // 2 blank rows
+  
+  // Section 2: Company Categorization Stats (if available)
+  if (stats.categorization.hasCategorization) {
+    currentRow = addCategorizationStatsSection(sheet, currentRow, stats.categorization);
+    currentRow += 2; // 2 blank rows
+  }
+  
+  // Section 3: CRM Ready Stats
+  currentRow = addCRMReadyStatsSection(sheet, currentRow, stats.crmReady);
+  currentRow += 2; // 2 blank rows
+  
+  // Section 4: Overall Pipeline Summary
+  currentRow = addOverallSummarySection(sheet, currentRow, stats.overall);
+  
+  // Format sheet
+  formatDashboard(sheet);
+}
+
+/**
+ * Adds main header to dashboard
+ */
+function addMainHeader(sheet, startRow) {
+  const title = '📊 DATA PIPELINE DASHBOARD';
+  const subtitle = `Last Updated: ${new Date().toLocaleString()}`;
+  
+  sheet.getRange(startRow, 1).setValue(title);
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontSize(20).setFontWeight('bold')
+    .setBackground(DASHBOARD_CONFIG.COLORS.HEADER_BG)
+    .setFontColor(DASHBOARD_CONFIG.COLORS.WHITE)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 50);
+  
+  startRow++;
+  
+  sheet.getRange(startRow, 1).setValue(subtitle);
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontSize(11).setFontStyle('italic')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 25);
+  
+  return startRow;
+}
+
+/**
+ * Adds Data Cleaning Stats section
+ */
+function addCleaningStatsSection(sheet, startRow, stats) {
+  // Section header
+  sheet.getRange(startRow, 1).setValue('🧹 DATA CLEANING STATISTICS');
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontWeight('bold').setFontSize(14)
+    .setBackground(DASHBOARD_CONFIG.COLORS.HEADER_BG)
+    .setFontColor(DASHBOARD_CONFIG.COLORS.WHITE)
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 35);
+  
+  startRow++;
+  
+  // Column headers
+  const headers = ['Metric', 'Count', 'Percentage', 'Details'];
+  sheet.getRange(startRow, 1, 1, 4).setValues([headers]);
+  sheet.getRange(startRow, 1, 1, 4).setFontWeight('bold')
+    .setBackground(DASHBOARD_CONFIG.COLORS.STAT_HEADER_BG)
+    .setHorizontalAlignment('center');
+  
+  startRow++;
+  
+  // Data rows
+  const originalCount = stats.originalMissing ? '❌ Sheet Missing' : stats.originalCount;
+  const cleanedCount = stats.cleanedMissing ? '❌ Sheet Missing' : stats.cleanedCount;
+  
+  const data = [
+    ['📥 Original Sheet Records', originalCount, '', 'Starting point'],
+    ['✅ Cleaned Data V3 Records', cleanedCount, stats.keptPercentage, 'After deduplication'],
+    ['❌ Duplicates Removed', stats.duplicatesRemoved, stats.removedPercentage, 'Duplicate rows removed']
+  ];
+  
+  sheet.getRange(startRow, 1, data.length, 4).setValues(data);
+  
+  // Format numbers and percentages
+  sheet.getRange(startRow, 2, 3, 1).setNumberFormat('#,##0');
+  sheet.getRange(startRow, 3, 3, 1).setNumberFormat('0.0%');
+  
+  return startRow + data.length - 1;
+}
+
+/**
+ * Adds CRM Ready Stats section
+ */
+function addCRMReadyStatsSection(sheet, startRow, stats) {
+  // Section header
+  sheet.getRange(startRow, 1).setValue('✅ CRM READY STATISTICS');
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontWeight('bold').setFontSize(14)
+    .setBackground(DASHBOARD_CONFIG.COLORS.HEADER_BG)
+    .setFontColor(DASHBOARD_CONFIG.COLORS.WHITE)
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 35);
+  
+  startRow++;
+  
+  // Column headers
+  const headers = ['Metric', 'Count', 'Percentage', 'Details'];
+  sheet.getRange(startRow, 1, 1, 4).setValues([headers]);
+  sheet.getRange(startRow, 1, 1, 4).setFontWeight('bold')
+    .setBackground(DASHBOARD_CONFIG.COLORS.STAT_HEADER_BG)
+    .setHorizontalAlignment('center');
+  
+  startRow++;
+  
+  // Data rows
+  const sourceName = stats.sourceName || 'Source';
+  const sourceCount = stats.sourceMissing ? '❌ Sheet Missing' : stats.sourceCount;
+  const crmReadyCount = stats.crmReadyMissing ? '❌ Sheet Missing' : stats.crmReadyCount;
+  
+  const data = [
+    [`📥 ${sourceName} Records`, sourceCount, '', 'Input to CRM Ready'],
+    ['✅ Included in CRM Ready', crmReadyCount, stats.includedPercentage, 'Valid email + valid phone'],
+    ['❌ Excluded Contacts', stats.excludedCount, stats.excludedPercentage, 'Missing email or phone']
+  ];
+  
+  sheet.getRange(startRow, 1, data.length, 4).setValues(data);
+  
+  // Format numbers and percentages
+  sheet.getRange(startRow, 2, 3, 1).setNumberFormat('#,##0');
+  sheet.getRange(startRow, 3, 3, 1).setNumberFormat('0.0%');
+  
+  return startRow + data.length - 1;
+}
+
+/**
+ * Adds Categorization Stats section
+ */
+function addCategorizationStatsSection(sheet, startRow, stats) {
+  // Section header
+  sheet.getRange(startRow, 1).setValue('🏠 COMPANY CATEGORIZATION STATISTICS');
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontWeight('bold').setFontSize(14)
+    .setBackground(DASHBOARD_CONFIG.COLORS.HEADER_BG)
+    .setFontColor(DASHBOARD_CONFIG.COLORS.WHITE)
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 35);
+  
+  startRow++;
+  
+  // Column headers
+  const headers = ['Category', 'Count', 'Percentage', 'Details'];
+  sheet.getRange(startRow, 1, 1, 4).setValues([headers]);
+  sheet.getRange(startRow, 1, 1, 4).setFontWeight('bold')
+    .setBackground(DASHBOARD_CONFIG.COLORS.STAT_HEADER_BG)
+    .setHorizontalAlignment('center');
+  
+  startRow++;
+  
+  // Data rows
+  const data = [
+    ['🏗️ Home Builders & Related', stats.homeBuilders, stats.homeBuildersPercentage, 'Target companies'],
+    ['🏢 Other Companies', stats.otherCompanies, stats.otherCompaniesPercentage, 'Non-target companies'],
+    ['❓ No Description', stats.noDescription, stats.noDescriptionPercentage, 'Needs categorization'],
+    ['', '', '', ''],
+    ['📊 Total Categorized', stats.total, 1.0, 'All companies processed']
+  ];
+  
+  sheet.getRange(startRow, 1, data.length, 4).setValues(data);
+  
+  // Format numbers and percentages
+  sheet.getRange(startRow, 2, data.length, 1).setNumberFormat('#,##0');
+  sheet.getRange(startRow, 3, data.length, 1).setNumberFormat('0.0%');
+  
+  // Bold total row
+  sheet.getRange(startRow + 4, 1, 1, 4).setFontWeight('bold');
+  
+  return startRow + data.length - 1;
+}
+
+/**
+ * Adds Overall Summary section
+ */
+function addOverallSummarySection(sheet, startRow, stats) {
+  // Section header
+  sheet.getRange(startRow, 1).setValue('🎯 OVERALL PIPELINE SUMMARY');
+  sheet.getRange(startRow, 1, 1, 4).merge();
+  sheet.getRange(startRow, 1).setFontWeight('bold').setFontSize(14)
+    .setBackground(DASHBOARD_CONFIG.COLORS.HEADER_BG)
+    .setFontColor(DASHBOARD_CONFIG.COLORS.WHITE)
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(startRow, 35);
+  
+  startRow++;
+  
+  // Column headers
+  const headers = ['Stage', 'Count', 'Percentage', 'Details'];
+  sheet.getRange(startRow, 1, 1, 4).setValues([headers]);
+  sheet.getRange(startRow, 1, 1, 4).setFontWeight('bold')
+    .setBackground(DASHBOARD_CONFIG.COLORS.STAT_HEADER_BG)
+    .setHorizontalAlignment('center');
+  
+  startRow++;
+  
+  // Data rows
+  const data = [
+    ['📥 Start: Original Sheet', stats.startCount, '', 'All raw data'],
+    ['📤 End: CRM Ready', stats.endCount, '', 'Final qualified contacts'],
+    ['', '', '', ''],
+    ['🎯 Overall Conversion Rate', '', stats.conversionRate, `${stats.endCount} out of ${stats.startCount} contacts`]
+  ];
+  
+  sheet.getRange(startRow, 1, data.length, 4).setValues(data);
+  
+  // Format numbers and percentages
+  sheet.getRange(startRow, 2, 2, 1).setNumberFormat('#,##0');
+  sheet.getRange(startRow + 3, 3, 1, 1).setNumberFormat('0.0%');
+  
+  // Bold conversion rate row
+  sheet.getRange(startRow + 3, 1, 1, 4).setFontWeight('bold').setFontSize(13);
+  sheet.setRowHeight(startRow + 3, 40);
+  
+  return startRow + data.length - 1;
+}
+
+/**
+ * Final formatting for dashboard
+ */
+function formatDashboard(sheet) {
+  // Set column widths
+  sheet.setColumnWidth(1, 280); // Metric column
+  sheet.setColumnWidth(2, 160); // Count column
+  sheet.setColumnWidth(3, 120); // Percentage column
+  sheet.setColumnWidth(4, 240); // Details column
+  
+  // Add borders to all content
+  const lastRow = sheet.getLastRow();
+  const lastCol = 4;
+  
+  if (lastRow > 0) {
+    sheet.getRange(1, 1, lastRow, lastCol).setBorder(
+      true, true, true, true, true, true,
+      '#cccccc', SpreadsheetApp.BorderStyle.SOLID
+    );
+  }
+  
+  // Freeze header rows
+  sheet.setFrozenRows(2);
+  
+  // Set default font
+  sheet.getRange(1, 1, lastRow, lastCol).setFontFamily('Arial');
+  
+  Logger.log('Dashboard formatting complete');
+}
