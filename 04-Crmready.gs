@@ -1,51 +1,43 @@
 /**
  * =============================================================================
- * CRM READY FILTER - V3.0
+ * CRM READY FILTER - V2.2 (ENHANCED LOGGING)
  * =============================================================================
  * 
  * Creates a single "CRM Ready" sheet with cleaned, validated data
  * 
+ * V2.2 CHANGES:
+ * - Enhanced logging to show which columns are validated vs skipped
+ * - Clear visibility into which emails/phones are considered for inclusion
+ * - Transparent reporting of validation status
+ * 
+ * V2.1 CHANGES:
+ * - CRITICAL FIX: Initialize ALL email and phone columns to empty first
+ * - Only fill in columns with explicit validation status
+ * - Prevents unvalidated data from appearing in output
+ * - Ensures only validated emails (status='valid') appear
+ * - Ensures only validated mobiles (status='valid confirmed' + type='mobile') appear
+ * 
  * CRITERIA:
- * - At least one valid email (only ONE kept with priority)
- * - At least one valid mobile phone
+ * - At least one valid email (status='valid')
+ * - At least one valid mobile phone (status='valid confirmed' + type='mobile')
  * 
- * EMAIL PRIORITY (only keeps ONE in single "email" column):
- * 1. Email 1 (highest priority)
- * 2. Email 2
- * 3. Personal Email
- * 4. Primary Email (lowest priority)
+ * VALIDATION RULES:
+ * - Emails: ONLY included if status column exists AND status='valid'
+ * - Phones: ONLY included if status AND line type columns exist AND status='valid confirmed' AND type='mobile'
+ * - Columns without validation columns: NEVER considered for inclusion or output
  * 
- * VALIDATION:
- * - Email validation: OPTIONAL (uses _Status columns if they exist)
- * - Phone validation: REQUIRED (_Status and _Line Type columns must exist)
- * - Only phone columns with BOTH validation columns will be included
- * - Example: If you only validated Contact Phone 1 and Contact Mobile Phone,
- *   only those two phone columns will appear in CRM Ready output
- * 
- * DATA CLEANING (when validation exists):
- * - Only keeps ONE valid email in single "email" column (highest priority)
- * - Invalid emails are cleared/empty
- * - Only keeps valid phones with line type mobile
- * - Invalid phones are cleared/empty
+ * DATA CLEANING:
+ * - Only keeps valid emails (invalid/unvalidated emails are cleared/empty)
+ * - Only keeps valid mobile phones (invalid/unvalidated/landline phones are cleared/empty)
  * - Extracts state from first valid phone location
  * 
- * OUTPUT COLUMNS (DYNAMIC):
- * Base columns (always included):
- *   organization, first_name, last_name, email, description, website, city, state
- * 
- * Phone columns (only if they exist in source):
- *   contact_phone1, company_phone1, company_phone2, contact_mobile_phone
- * 
- * Example output (all phones exist):
- *   organization, first_name, last_name, email, contact_phone1, company_phone1,
- *   company_phone2, contact_mobile_phone, description, website, city, state
- * 
- * Example output (only 2 phones exist):
- *   organization, first_name, last_name, email, contact_phone1, contact_mobile_phone,
- *   description, website, city, state
+ * OUTPUT COLUMNS (FIXED ORDER):
+ * organization, first_name, last_name, Primary Email, Personal Email, 
+ * Email 1, Email 2, Contact Phone 1, Company Phone 1, Company Phone 2, 
+ * Contact Mobile Phone, description, website, city, state
  * 
  * @author: Claude
- * @version: 3.0 - Single email column, dynamic phone columns, underscore naming
+ * @version: 2.2 - Enhanced logging for transparency
  */
 
 // =============================================================================
@@ -56,9 +48,9 @@ const CRM_CONFIG = {
   // Email column names (must match exactly)
   EMAIL_COLUMNS: {
     'Primary Email': 'Primary Email',
+    'Personal Email': 'Personal Email',
     'Email 1': 'Email 1',
-    'Email 2': 'Email 2',
-    'Personal Email': 'Personal Email'
+    'Email 2': 'Email 2'
   },
   
   // Phone column names (must match exactly)
@@ -84,36 +76,32 @@ const CRM_CONFIG = {
   LINE_TYPE_SUFFIX: '_Line Type',
   LOCATION_SUFFIX: '_Location',
   
-  // Valid criteria (case-insensitive matching)
+  // Valid criteria
   VALID_EMAIL_STATUS: 'valid',
-  VALID_PHONE_STATUS: 'valid_confirmed',  // Matches both "VALID_CONFIRMED" and "valid confirmed"
-  VALID_LINE_TYPES: [
-    'mobile', 'MOBILE'  // ONLY mobile phones (removed fixed_line, landline)
-  ],
+  VALID_PHONE_STATUS: 'valid confirmed',
+  VALID_LINE_TYPE: 'mobile',
   
   // Output sheet name
   OUTPUT_SHEET: 'CRM Ready',
   
-  // Base output columns (always included)
-  BASE_OUTPUT_COLUMNS: [
+  // Output column order (EXACT ORDER - DO NOT CHANGE)
+  OUTPUT_COLUMNS: [
     'organization',
     'first_name',
     'last_name',
-    'email',  // Single email column (highest priority valid email)
+    'Primary Email',
+    'Personal Email',
+    'Email 1',
+    'Email 2',
+    'Contact Phone 1',
+    'Company Phone 1',
+    'Company Phone 2',
+    'Contact Mobile Phone',
     'description',
     'website',
     'city',
     'state'
   ],
-  
-  // Phone column mapping (output name → source name)
-  // Only phone columns that exist in source will be included in output
-  PHONE_OUTPUT_MAP: {
-    'contact_phone1': 'Contact Phone 1',
-    'company_phone1': 'Company Phone 1',
-    'company_phone2': 'Company Phone 2',
-    'contact_mobile_phone': 'Contact Mobile Phone'
-  },
   
   FIRST_DATA_ROW: 2
 };
@@ -151,10 +139,10 @@ function createCRMReady() {
     SpreadsheetApp.getUi().alert(
       'Error',
       'Could not find required columns!\n\n' +
-      'Please ensure you have these columns in your active sheet:\n' +
-      '• At least one email column (Primary Email, Email 1, Email 2, or Personal Email)\n' +
-      '• At least one phone column (Contact Phone 1, Company Phone 1, Company Phone 2, or Contact Mobile Phone)\n\n' +
-      'Note: Validation status columns are optional. If present, they will be used to filter valid contacts.',
+      'Please ensure you have:\n' +
+      '1. Run email validation (at least one email column)\n' +
+      '2. Run phone validation (at least one phone column)\n\n' +
+      'Then try again.',
       SpreadsheetApp.getUi().ButtonSet.OK
     );
     return;
@@ -163,22 +151,14 @@ function createCRMReady() {
   Logger.log('Found all required columns');
   
   // Process data
-  const result = processCRMData(sourceSheet, columnMap);
-  const crmData = result.data;
-  const stats = result.stats;
+  const crmData = processCRMData(sourceSheet, columnMap);
   
   if (crmData.length === 0) {
     SpreadsheetApp.getUi().alert(
       'No Data Found',
-      'No contacts meet the STRICT criteria:\n\n' +
-      `Total rows: ${stats.total}\n` +
-      `Excluded:\n` +
-      `  - Missing valid email: ${stats.excludedNoEmail}\n` +
-      `  - Missing mobile phone: ${stats.excludedNoPhone}\n` +
-      `  - Missing BOTH: ${stats.excludedBoth}\n\n` +
-      'Requirements (BOTH needed):\n' +
-      '✓ At least one valid email (Primary Email, Email 1, Email 2, or Personal Email)\n' +
-      '✓ At least 1 mobile phone = valid\n\n' +
+      'No contacts meet the criteria:\n' +
+      '- At least one valid email\n' +
+      '- At least one valid mobile phone\n\n' +
       'Please validate your data and try again.',
       SpreadsheetApp.getUi().ButtonSet.OK
     );
@@ -186,7 +166,7 @@ function createCRMReady() {
   }
   
   // Create CRM Ready sheet
-  createCRMSheet(spreadsheet, crmData, columnMap);
+  createCRMSheet(spreadsheet, crmData);
   
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
@@ -197,20 +177,15 @@ function createCRMReady() {
   
   SpreadsheetApp.getUi().alert(
     'CRM Ready Created!',
-    `✅ Successfully created CRM Ready sheet!\n\n` +
-    `📊 Summary:\n` +
-    `Total rows: ${stats.total}\n` +
-    `Included: ${stats.included} (${(stats.included / stats.total * 100).toFixed(1)}%)\n` +
-    `Excluded: ${stats.excluded} (${(stats.excluded / stats.total * 100).toFixed(1)}%)\n\n` +
-    `❌ Exclusions:\n` +
-    `  - Missing valid email: ${stats.excludedNoEmail}\n` +
-    `  - Missing mobile phone: ${stats.excludedNoPhone}\n` +
-    `  - Missing BOTH: ${stats.excludedBoth}\n\n` +
-    `✅ Included contacts have:\n` +
-    `  - Valid email (any email column) ✓\n` +
-    `  - At least 1 valid mobile phone ✓\n\n` +
-    `Sheet: "${CRM_CONFIG.OUTPUT_SHEET}"\n` +
-    `Duration: ${duration}s`,
+    `Successfully created CRM Ready sheet with ${crmData.length} contacts in ${duration} seconds.\n\n` +
+    `✅ All contacts have:\n` +
+    `   - At least one valid email\n` +
+    `   - At least one valid mobile phone\n\n` +
+    `✅ Data cleaned:\n` +
+    `   - Invalid emails removed\n` +
+    `   - Invalid/landline phones removed\n` +
+    `   - State extracted from phone location\n\n` +
+    `Sheet: "${CRM_CONFIG.OUTPUT_SHEET}"`,
     SpreadsheetApp.getUi().ButtonSet.OK
   );
 }
@@ -241,7 +216,10 @@ function findAllColumns(sheet) {
     }
   }
   
-  // Find email columns (with OR without status columns)
+  // Find email columns and their status columns
+  const validatedEmails = [];
+  const skippedEmails = [];
+  
   for (const [key, colName] of Object.entries(CRM_CONFIG.EMAIL_COLUMNS)) {
     const emailIdx = headers.findIndex(h => 
       String(h).trim().toLowerCase() === colName.toLowerCase()
@@ -250,16 +228,22 @@ function findAllColumns(sheet) {
       String(h).trim().toLowerCase() === (colName + CRM_CONFIG.STATUS_SUFFIX).toLowerCase()
     );
     
-    // Include email column even without status (just check if email exists)
-    if (emailIdx !== -1) {
+    if (emailIdx !== -1 && statusIdx !== -1) {
       columnMap.emails[key] = {
         dataIndex: emailIdx,
-        statusIndex: statusIdx !== -1 ? statusIdx : null  // null if no status column
+        statusIndex: statusIdx
       };
+      validatedEmails.push(key);
+    } else {
+      const reason = emailIdx === -1 ? 'data column missing' : 'status column missing';
+      skippedEmails.push(`${key} (${reason})`);
     }
   }
   
-  // Find phone columns (ONLY with validation columns - must have _Status and _Line Type)
+  // Find phone columns and their validation columns
+  const validatedPhones = [];
+  const skippedPhones = [];
+  
   for (const [key, colName] of Object.entries(CRM_CONFIG.PHONE_COLUMNS)) {
     const phoneIdx = headers.findIndex(h => 
       String(h).trim().toLowerCase() === colName.toLowerCase()
@@ -274,27 +258,43 @@ function findAllColumns(sheet) {
       String(h).trim().toLowerCase() === (colName + CRM_CONFIG.LOCATION_SUFFIX).toLowerCase()
     );
     
-    // ONLY include phone column if it has BOTH status AND line type validation columns
-    // This ensures we only include phones that were actually validated
     if (phoneIdx !== -1 && statusIdx !== -1 && lineTypeIdx !== -1) {
       columnMap.phones[key] = {
         dataIndex: phoneIdx,
         statusIndex: statusIdx,
         lineTypeIndex: lineTypeIdx,
-        locationIndex: locationIdx !== -1 ? locationIdx : null  // Location is optional
+        locationIndex: locationIdx !== -1 ? locationIdx : null
       };
+      validatedPhones.push(key);
+    } else {
+      const reasons = [];
+      if (phoneIdx === -1) reasons.push('data column missing');
+      if (statusIdx === -1) reasons.push('status column missing');
+      if (lineTypeIdx === -1) reasons.push('line type column missing');
+      skippedPhones.push(`${key} (${reasons.join(', ')})`);
     }
   }
   
-  // Check if we have at least one email and one phone column
+  // Check if we have at least one email and one phone
   if (Object.keys(columnMap.emails).length === 0 || 
       Object.keys(columnMap.phones).length === 0) {
     return null;
   }
   
   Logger.log(`Found ${Object.keys(columnMap.base).length} base columns`);
-  Logger.log(`Found ${Object.keys(columnMap.emails).length} email columns`);
-  Logger.log(`Found ${Object.keys(columnMap.phones).length} phone columns`);
+  Logger.log(`\n✅ VALIDATED EMAILS (will be checked for inclusion):`);
+  validatedEmails.forEach(email => Logger.log(`  - ${email}`));
+  if (skippedEmails.length > 0) {
+    Logger.log(`\n❌ SKIPPED EMAILS (no validation columns, will NOT be checked):`);
+    skippedEmails.forEach(email => Logger.log(`  - ${email}`));
+  }
+  Logger.log(`\n✅ VALIDATED PHONES (will be checked for inclusion):`);
+  validatedPhones.forEach(phone => Logger.log(`  - ${phone}`));
+  if (skippedPhones.length > 0) {
+    Logger.log(`\n❌ SKIPPED PHONES (no validation columns, will NOT be checked):`);
+    skippedPhones.forEach(phone => Logger.log(`  - ${phone}`));
+  }
+  Logger.log('');
   
   return columnMap;
 }
@@ -313,39 +313,19 @@ function processCRMData(sourceSheet, columnMap) {
   const allData = sourceSheet.getRange(1, 1, lastRow, lastCol).getValues();
   const crmData = [];
   
-  // Counters for tracking inclusions/exclusions
-  let includedCount = 0;
-  let excludedNoEmail = 0;
-  let excludedNoPhone = 0;
-  let excludedBoth = 0;
-  
   Logger.log(`Processing ${lastRow - CRM_CONFIG.FIRST_DATA_ROW + 1} rows...`);
   
   for (let i = CRM_CONFIG.FIRST_DATA_ROW - 1; i < lastRow; i++) {
     const row = allData[i];
     
-    // Check if row meets criteria (BOTH required)
+    // Check if row meets criteria
     const hasValidEmail = checkEmailCriteriaCRM(row, columnMap.emails);
-    const hasValidPhone = checkPhoneCriteriaCRM(row, columnMap.phones);
+    const hasValidMobile = checkPhoneCriteriaCRM(row, columnMap.phones);
     
-    // BOTH email AND phone required - if either is missing, exclude
-    if (hasValidEmail && hasValidPhone) {
-      // ✅ Contact meets BOTH criteria - include in CRM Ready
+    if (hasValidEmail && hasValidMobile) {
+      // Build CRM row
       const crmRow = buildCRMRow(row, columnMap);
       crmData.push(crmRow);
-      includedCount++;
-    } else {
-      // ❌ Contact missing email OR phone - exclude from CRM Ready
-      if (!hasValidEmail && !hasValidPhone) {
-        excludedBoth++;
-        Logger.log(`  Row ${i + 1}: Excluded (no valid email AND no valid mobile phone)`);
-      } else if (!hasValidEmail) {
-        excludedNoEmail++;
-        Logger.log(`  Row ${i + 1}: Excluded (no valid email)`);
-      } else if (!hasValidPhone) {
-        excludedNoPhone++;
-        Logger.log(`  Row ${i + 1}: Excluded (no valid mobile phone)`);
-      }
     }
     
     if ((i + 1) % 1000 === 0) {
@@ -353,50 +333,19 @@ function processCRMData(sourceSheet, columnMap) {
     }
   }
   
-  // Summary
-  const totalProcessed = lastRow - CRM_CONFIG.FIRST_DATA_ROW + 1;
-  const totalExcluded = excludedNoEmail + excludedNoPhone + excludedBoth;
+  Logger.log(`Found ${crmData.length} contacts that meet criteria`);
   
-  Logger.log('\n=== CRM Ready Summary ===');
-  Logger.log(`Total rows processed: ${totalProcessed}`);
-  Logger.log(`✅ Included (meet BOTH criteria): ${includedCount}`);
-  Logger.log(`❌ Excluded (total): ${totalExcluded}`);
-  Logger.log(`   - Missing valid email only: ${excludedNoEmail}`);
-  Logger.log(`   - Missing mobile phone only: ${excludedNoPhone}`);
-  Logger.log(`   - Missing BOTH: ${excludedBoth}`);
-  Logger.log(`\nInclusion rate: ${(includedCount / totalProcessed * 100).toFixed(1)}%`);
-  
-  return {
-    data: crmData,
-    stats: {
-      total: totalProcessed,
-      included: includedCount,
-      excluded: totalExcluded,
-      excludedNoEmail: excludedNoEmail,
-      excludedNoPhone: excludedNoPhone,
-      excludedBoth: excludedBoth
-    }
-  };
+  return crmData;
 }
 
 /**
  * Checks if row has at least one valid email
- * If validation status exists, use it. Otherwise, just check if email has a value.
  */
 function checkEmailCriteriaCRM(row, emailCols) {
   for (const col of Object.values(emailCols)) {
-    // If status column exists, check validation status
-    if (col.statusIndex !== null) {
-      const status = String(row[col.statusIndex] || '').toLowerCase().trim();
-      if (status === CRM_CONFIG.VALID_EMAIL_STATUS) {
-        return true;
-      }
-    } else {
-      // No status column - just check if email has a value
-      const email = String(row[col.dataIndex] || '').trim();
-      if (email && email.length > 0) {
-        return true;
-      }
+    const status = String(row[col.statusIndex] || '').toLowerCase().trim();
+    if (status === CRM_CONFIG.VALID_EMAIL_STATUS) {
+      return true;
     }
   }
   return false;
@@ -404,23 +353,12 @@ function checkEmailCriteriaCRM(row, emailCols) {
 
 /**
  * Checks if row has at least one valid mobile phone
- * All phones in phoneCols are guaranteed to have validation columns
  */
 function checkPhoneCriteriaCRM(row, phoneCols) {
   for (const col of Object.values(phoneCols)) {
-    // Check validation status (guaranteed to exist)
     const status = String(row[col.statusIndex] || '').toLowerCase().trim();
     const lineType = String(row[col.lineTypeIndex] || '').toLowerCase().trim();
-    
-    // Check if status is valid (handle both "valid_confirmed" and "valid confirmed")
-    const isValidStatus = (status === 'valid_confirmed' || status === 'valid confirmed');
-    
-    // Check if line type is valid (case-insensitive)
-    const isValidLineType = CRM_CONFIG.VALID_LINE_TYPES.some(type => 
-      type.toLowerCase() === lineType
-    );
-    
-    if (isValidStatus && isValidLineType) {
+    if (status === CRM_CONFIG.VALID_PHONE_STATUS && lineType === CRM_CONFIG.VALID_LINE_TYPE) {
       return true;
     }
   }
@@ -438,72 +376,37 @@ function buildCRMRow(row, columnMap) {
     crmRow[key] = idx !== undefined ? String(row[idx] || '').trim() : '';
   }
   
-  // 2. Get valid emails - ONLY keep ONE (highest priority) in single "email" column
-  // Priority: Email 1 > Email 2 > Personal Email > Primary Email
-  let validEmailFound = false;
-  const emailPriority = ['Email 1', 'Email 2', 'Personal Email', 'Primary Email'];
-  
-  // Initialize email as empty
-  crmRow['email'] = '';
-  
-  // Find first valid email in priority order
-  for (const priorityKey of emailPriority) {
-    if (validEmailFound) break;  // Already found valid email, stop
-    
-    const col = columnMap.emails[priorityKey];
-    if (!col) continue;  // Column doesn't exist in source
-    
-    // Check if email is valid
-    let isValid = false;
-    let emailValue = '';
-    
-    if (col.statusIndex !== null) {
-      // Status column exists - check validation status
-      const status = String(row[col.statusIndex] || '').toLowerCase().trim();
-      if (status === CRM_CONFIG.VALID_EMAIL_STATUS) {
-        isValid = true;
-        emailValue = String(row[col.dataIndex] || '').trim();
-      }
-    } else {
-      // No status column - check if email has a value
-      emailValue = String(row[col.dataIndex] || '').trim();
-      if (emailValue && emailValue.length > 0) {
-        isValid = true;
-      }
-    }
-    
-    // If valid email found, put in single "email" column
-    if (isValid && emailValue) {
-      crmRow['email'] = emailValue;
-      validEmailFound = true;
-    }
+  // 2. Initialize ALL email columns to empty FIRST
+  //    (This ensures unvalidated emails don't appear in output)
+  for (const key of Object.keys(CRM_CONFIG.EMAIL_COLUMNS)) {
+    crmRow[key] = '';
   }
   
-  // 3. Get valid phones only (mobile phones) - use output column names (underscore format)
-  // Note: All phones in columnMap.phones are guaranteed to have validation columns
+  // 3. Fill in ONLY emails with status='valid'
+  //    (Only validated emails with 'valid' status will appear)
+  for (const [key, col] of Object.entries(columnMap.emails)) {
+    const status = String(row[col.statusIndex] || '').toLowerCase().trim();
+    if (status === CRM_CONFIG.VALID_EMAIL_STATUS) {
+      crmRow[key] = String(row[col.dataIndex] || '').trim();
+    }
+    // else stays empty (already initialized above)
+  }
+  
+  // 4. Initialize ALL phone columns to empty FIRST
+  //    (This ensures unvalidated phones don't appear in output)
+  for (const key of Object.keys(CRM_CONFIG.PHONE_COLUMNS)) {
+    crmRow[key] = '';
+  }
+  
+  // 5. Fill in ONLY valid mobile phones
+  //    (Only phones with 'valid confirmed' status AND 'mobile' type will appear)
   let stateExtracted = false;
-  for (const [sourceKey, col] of Object.entries(columnMap.phones)) {
-    // Map source column name to output column name (with underscores)
-    const outputKey = Object.keys(CRM_CONFIG.PHONE_OUTPUT_MAP).find(
-      k => CRM_CONFIG.PHONE_OUTPUT_MAP[k] === sourceKey
-    );
-    
-    if (!outputKey) continue;  // Column not in output map
-    
-    // Check validation status (guaranteed to exist)
+  for (const [key, col] of Object.entries(columnMap.phones)) {
     const status = String(row[col.statusIndex] || '').toLowerCase().trim();
     const lineType = String(row[col.lineTypeIndex] || '').toLowerCase().trim();
     
-    // Check if status is valid (handle both formats)
-    const isValidStatus = (status === 'valid_confirmed' || status === 'valid confirmed');
-    
-    // Check if line type is valid (case-insensitive)
-    const isValidLineType = CRM_CONFIG.VALID_LINE_TYPES.some(type => 
-      type.toLowerCase() === lineType
-    );
-    
-    if (isValidStatus && isValidLineType) {
-      crmRow[outputKey] = String(row[col.dataIndex] || '').trim();
+    if (status === CRM_CONFIG.VALID_PHONE_STATUS && lineType === CRM_CONFIG.VALID_LINE_TYPE) {
+      crmRow[key] = String(row[col.dataIndex] || '').trim();
       
       // Extract state from first valid phone (if not already extracted)
       if (!stateExtracted && col.locationIndex !== null) {
@@ -511,9 +414,8 @@ function buildCRMRow(row, columnMap) {
         crmRow['state'] = extractState(location);
         stateExtracted = true;
       }
-    } else {
-      crmRow[outputKey] = ''; // Clear invalid phone
     }
+    // else stays empty (already initialized above)
   }
   
   // If no state extracted yet, leave empty
@@ -576,7 +478,7 @@ function extractState(location) {
 /**
  * Creates the CRM Ready sheet
  */
-function createCRMSheet(spreadsheet, crmData, columnMap) {
+function createCRMSheet(spreadsheet, crmData) {
   // Delete existing sheet if it exists
   const existingSheet = spreadsheet.getSheetByName(CRM_CONFIG.OUTPUT_SHEET);
   if (existingSheet) {
@@ -586,23 +488,8 @@ function createCRMSheet(spreadsheet, crmData, columnMap) {
   // Create new sheet
   const newSheet = spreadsheet.insertSheet(CRM_CONFIG.OUTPUT_SHEET);
   
-  // Build dynamic headers based on what phone columns exist in source
-  const headers = [...CRM_CONFIG.BASE_OUTPUT_COLUMNS];
-  
-  // Insert phone columns in specific order (only if they exist in source)
-  const phoneHeaders = [];
-  for (const [outputName, sourceName] of Object.entries(CRM_CONFIG.PHONE_OUTPUT_MAP)) {
-    if (columnMap.phones[sourceName]) {
-      phoneHeaders.push(outputName);
-    }
-  }
-  
-  // Insert phone columns after 'email' (index 3)
-  headers.splice(4, 0, ...phoneHeaders);
-  
-  Logger.log(`Output columns: ${headers.join(', ')}`);
-  
-  // Set headers
+  // Set headers (EXACT ORDER from config)
+  const headers = CRM_CONFIG.OUTPUT_COLUMNS;
   newSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   newSheet.getRange(1, 1, 1, headers.length)
     .setFontWeight('bold')
@@ -623,7 +510,7 @@ function createCRMSheet(spreadsheet, crmData, columnMap) {
   newSheet.setFrozenRows(1);
   newSheet.autoResizeColumns(1, headers.length);
   
-  Logger.log(`Created CRM Ready sheet with ${dataRows.length} rows and ${headers.length} columns`);
+  Logger.log(`Created CRM Ready sheet with ${dataRows.length} rows`);
 }
 
 // =============================================================================
@@ -637,30 +524,26 @@ function showCRMConfig() {
   const html = HtmlService.createHtmlOutput(`
     <h3>CRM Ready Configuration</h3>
     
-    <h4>✅ Criteria (STRICT):</h4>
+    <h4>✅ Criteria:</h4>
     <ul>
-      <li><strong>Email:</strong> Primary Email must have status = "valid"</li>
+      <li><strong>Email:</strong> At least one email with status = "valid"</li>
       <li><strong>Phone:</strong> At least one phone with:
         <ul>
-          <li>Status = "valid confirmed" (or "VALID_CONFIRMED")</li>
-          <li>Line Type = "mobile" (or "MOBILE") ONLY</li>
+          <li>Status = "valid confirmed"</li>
+          <li>Line Type = "mobile"</li>
         </ul>
       </li>
     </ul>
     
-    <p><strong>⚠️ Note:</strong> Fixed line/landline phones are NOT included (mobile only).</p>
-    
     <h4>🧹 Data Cleaning:</h4>
     <ul>
       <li>Invalid emails → Cleared (empty cell)</li>
-      <li>Other emails (Personal, Email 1, Email 2) → Not included</li>
       <li>Invalid phones → Cleared (empty cell)</li>
-      <li>Valid mobile phones → Kept ✓</li>
-      <li>Fixed line phones → Cleared (mobile only) ❌</li>
-      <li>State → Extracted from first valid mobile phone location</li>
+      <li>Landline phones → Cleared (empty cell)</li>
+      <li>State → Extracted from first valid phone location</li>
     </ul>
     
-    <h4>📊 Output Columns (12 Total):</h4>
+    <h4>📊 Output Columns (Fixed Order):</h4>
     <ol>
       ${CRM_CONFIG.OUTPUT_COLUMNS.map(col => '<li>' + col + '</li>').join('')}
     </ol>
@@ -669,10 +552,10 @@ function showCRMConfig() {
     <p><strong>${CRM_CONFIG.OUTPUT_SHEET}</strong> (Blue header)</p>
     
     <br>
-    <p><em>Only contacts with valid Primary Email AND at least one valid mobile phone are included.</em></p>
+    <p><em>Only contacts meeting both criteria are included.</em></p>
   `)
-    .setWidth(550)
-    .setHeight(650);
+    .setWidth(500)
+    .setHeight(600);
   
-  SpreadsheetApp.getUi().showModalDialog(html, 'CRM Ready Settings (STRICT)');
+  SpreadsheetApp.getUi().showModalDialog(html, 'CRM Ready Settings');
 }
