@@ -1,1 +1,532 @@
+/**
+ * =============================================================================
+ * AUDIT REPORT - V1.0
+ * =============================================================================
+ *
+ * Reads the Raw Data tab and calculates:
+ *   - Total rows in Raw Data
+ *   - How many rows would be removed as duplicates
+ *     (using the same key as the pipeline: Contact Full Name + Company Name + Email 1)
+ *   - How many rows match companies in the Exclude tab
+ *   - Expected unique contacts = Total - Duplicates - Excluded
+ *   - Actual rows in the Validation tab (already cleaned)
+ *   - Difference between expected and actual (should be 0 if everything matches)
+ *
+ * SHEETS READ:
+ *   - "Raw Data"   → source data (read-only, never modified)
+ *   - "Exclude"    → list of companies to exclude (Company Name column)
+ *   - "Validation" → already-cleaned sheet for comparison
+ *
+ * OUTPUT:
+ *   - "Audit Report" tab (created/overwritten)
+ *
+ * DUPLICATE KEY (same as pipeline):
+ *   Contact Full Name + Company Name + Email 1
+ *   Falls back to simpler keys when fields are missing.
+ *
+ * MENU: 🔧 Data Tools → 🧹 Data Cleanup → 📋 Audit Report
+ *
+ * @author: Claude
+ * @version: 1.0
+ */
 
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const AUDIT_CONFIG = {
+  RAW_DATA_SHEET:   'Raw Data',
+  EXCLUDE_SHEET:    'Exclude',
+  VALIDATION_SHEET: 'Validation',
+  AUDIT_SHEET:      'Audit Report',
+
+  // Column names
+  FULL_NAME_COL:    'Contact Full Name',
+  COMPANY_COL:      'Company Name',
+  EMAIL_COL:        'Email 1',
+
+  // Colors
+  HEADER_BG:        '#1a73e8',   // Blue  — section headers
+  LABEL_BG:         '#e8eaed',   // Gray  — column headers
+  HIGHLIGHT_BG:     '#e8f0fe',   // Light blue — key result rows
+  MATCH_BG:         '#e6f4ea',   // Light green — numbers match
+  MISMATCH_BG:      '#fce8e6',   // Light red   — numbers don't match
+  WHITE:            '#ffffff',
+  BLACK:            '#000000'
+};
+
+// =============================================================================
+// MAIN FUNCTION
+// =============================================================================
+
+/**
+ * Entry point — called from the menu.
+ * Reads Raw Data, calculates duplicates and exclusions,
+ * compares against Validation, writes Audit Report tab.
+ */
+function generateAuditReport() {
+  try {
+    const startTime = new Date();
+    Logger.log('=== Generating Audit Report ===');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // ── Get required sheets ───────────────────────────────────────────────────
+    const rawDataSheet    = ss.getSheetByName(AUDIT_CONFIG.RAW_DATA_SHEET);
+    const excludeSheet    = ss.getSheetByName(AUDIT_CONFIG.EXCLUDE_SHEET);
+    const validationSheet = ss.getSheetByName(AUDIT_CONFIG.VALIDATION_SHEET);
+
+    if (!rawDataSheet) {
+      SpreadsheetApp.getUi().alert('⚠️ Missing Sheet',
+        `Could not find the "${AUDIT_CONFIG.RAW_DATA_SHEET}" tab.\n` +
+        'Please make sure your source data sheet is named exactly "Raw Data".',
+        SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    // ── Read Raw Data ─────────────────────────────────────────────────────────
+    const rawLastRow = rawDataSheet.getLastRow();
+    const rawLastCol = rawDataSheet.getLastColumn();
+
+    if (rawLastRow < 2) {
+      SpreadsheetApp.getUi().alert('⚠️ No Data',
+        `The "${AUDIT_CONFIG.RAW_DATA_SHEET}" tab has no data rows.`,
+        SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    const rawAllData = rawDataSheet.getRange(1, 1, rawLastRow, rawLastCol).getValues();
+    const rawHeaders = rawAllData[0].map(h => h.toString().trim());
+    const rawRows    = rawAllData.slice(1);
+    const totalRaw   = rawRows.length;
+
+    Logger.log(`Raw Data: ${totalRaw} rows`);
+
+    // ── Find column indices in Raw Data ───────────────────────────────────────
+    const fullNameIdx = rawHeaders.findIndex(h => h.toLowerCase() === AUDIT_CONFIG.FULL_NAME_COL.toLowerCase());
+    const companyIdx  = rawHeaders.findIndex(h => h.toLowerCase() === AUDIT_CONFIG.COMPANY_COL.toLowerCase());
+    const email1Idx   = rawHeaders.findIndex(h => h.toLowerCase() === AUDIT_CONFIG.EMAIL_COL.toLowerCase());
+
+    if (companyIdx === -1) {
+      SpreadsheetApp.getUi().alert('⚠️ Missing Column',
+        `Column "${AUDIT_CONFIG.COMPANY_COL}" not found in "${AUDIT_CONFIG.RAW_DATA_SHEET}".\n` +
+        `Available headers: ${rawHeaders.join(', ')}`,
+        SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    // ── Count duplicates using same key as pipeline ───────────────────────────
+    const dupStats = countDuplicates(rawRows, fullNameIdx, companyIdx, email1Idx);
+    Logger.log(`Duplicates: ${dupStats.duplicateCount} (${dupStats.uniqueCount} unique)`);
+
+    // ── Count excluded companies ──────────────────────────────────────────────
+    const excludeStats = countExcluded(rawRows, companyIdx, excludeSheet);
+    Logger.log(`Excluded: ${excludeStats.excludedCount} rows match exclude list (${excludeStats.excludeListSize} companies in list)`);
+
+    // ── Calculate expected unique contacts ────────────────────────────────────
+    // Note: a row could be BOTH a duplicate AND excluded, so we need to
+    // count rows that are unique AND not excluded
+    const expectedUnique = countUniqueAndNotExcluded(rawRows, fullNameIdx, companyIdx, email1Idx, excludeStats.excludeSet);
+    Logger.log(`Expected unique (after dedup + exclusion): ${expectedUnique}`);
+
+    // ── Count actual rows in Validation ───────────────────────────────────────
+    let actualValidation = 0;
+    let validationMissing = false;
+    if (validationSheet) {
+      actualValidation = Math.max(0, validationSheet.getLastRow() - 1); // subtract header
+    } else {
+      validationMissing = true;
+      Logger.log(`Warning: "${AUDIT_CONFIG.VALIDATION_SHEET}" tab not found`);
+    }
+
+    const difference = actualValidation - expectedUnique;
+
+    // ── Write Audit Report ────────────────────────────────────────────────────
+    writeAuditReport(ss, {
+      totalRaw,
+      duplicateCount:    dupStats.duplicateCount,
+      uniqueAfterDedup:  dupStats.uniqueCount,
+      excludeListSize:   excludeStats.excludeListSize,
+      excludedCount:     excludeStats.excludedCount,
+      expectedUnique,
+      actualValidation,
+      validationMissing,
+      difference,
+      dupBreakdown:      dupStats.breakdown
+    });
+
+    const duration = ((new Date() - startTime) / 1000).toFixed(1);
+    Logger.log(`=== Audit Report complete in ${duration}s ===`);
+
+    SpreadsheetApp.getUi().alert(
+      '✅ Audit Report Generated',
+      `📊 Summary:\n\n` +
+      `  Total in Raw Data:         ${totalRaw}\n` +
+      `  Duplicates found:          ${dupStats.duplicateCount}\n` +
+      `  Excluded companies:        ${excludeStats.excludedCount}\n` +
+      `  ──────────────────────────\n` +
+      `  Expected in Validation:    ${expectedUnique}\n` +
+      `  Actual in Validation:      ${validationMissing ? '(tab not found)' : actualValidation}\n` +
+      `  Difference:                ${validationMissing ? 'N/A' : (difference === 0 ? '✅ 0 (matches!)' : `⚠️ ${difference}`)}\n\n` +
+      `Full details in the "${AUDIT_CONFIG.AUDIT_SHEET}" tab.`,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+
+    ss.setActiveSheet(ss.getSheetByName(AUDIT_CONFIG.AUDIT_SHEET));
+
+  } catch (error) {
+    Logger.log('ERROR: ' + error.toString());
+    SpreadsheetApp.getUi().alert('❌ Error',
+      'Audit report failed:\n\n' + error.toString(),
+      SpreadsheetApp.getUi().ButtonSet.OK);
+    throw error;
+  }
+}
+
+// =============================================================================
+// DUPLICATE COUNTING
+// =============================================================================
+
+/**
+ * Counts duplicate rows using the same composite key as the pipeline.
+ * Key priority:
+ *   1. Contact Full Name + Company Name + Email 1
+ *   2. Contact Full Name + Company Name
+ *   3. Company Name + Email 1
+ *   4. Company Name only
+ *
+ * @returns {{ duplicateCount, uniqueCount, breakdown }}
+ */
+function countDuplicates(rows, fullNameIdx, companyIdx, email1Idx) {
+  const seen       = new Set();
+  const breakdown  = { byKey: {} };
+  let duplicateCount = 0;
+
+  rows.forEach(row => {
+    const name    = fullNameIdx !== -1 ? (row[fullNameIdx] || '').toString().trim().toLowerCase() : '';
+    const company = normalizeCompanyForAudit(row[companyIdx]);
+    const email   = email1Idx  !== -1 ? (row[email1Idx]   || '').toString().trim().toLowerCase() : '';
+
+    let key, keyLabel;
+
+    if (name && company && email) {
+      key      = `${name}|${company}|${email}`;
+      keyLabel = 'Name + Company + Email 1';
+    } else if (name && company) {
+      key      = `${name}|${company}`;
+      keyLabel = 'Name + Company';
+    } else if (company && email) {
+      key      = `${company}|${email}`;
+      keyLabel = 'Company + Email 1';
+    } else if (company) {
+      key      = company;
+      keyLabel = 'Company only';
+    } else {
+      key      = `${name}|${company}|${email}`;
+      keyLabel = 'All fields';
+    }
+
+    if (seen.has(key)) {
+      duplicateCount++;
+      breakdown.byKey[keyLabel] = (breakdown.byKey[keyLabel] || 0) + 1;
+    } else {
+      seen.add(key);
+    }
+  });
+
+  return {
+    duplicateCount,
+    uniqueCount: rows.length - duplicateCount,
+    breakdown
+  };
+}
+
+// =============================================================================
+// EXCLUSION COUNTING
+// =============================================================================
+
+/**
+ * Counts how many rows in rawRows match a company in the Exclude tab.
+ *
+ * @returns {{ excludedCount, excludeListSize, excludeSet }}
+ */
+function countExcluded(rows, companyIdx, excludeSheet) {
+  // Build exclude set
+  const excludeSet = new Set();
+
+  if (excludeSheet) {
+    const lastRow = excludeSheet.getLastRow();
+    if (lastRow >= 2) {
+      const data       = excludeSheet.getRange(1, 1, lastRow, excludeSheet.getLastColumn()).getValues();
+      const headers    = data[0].map(h => h.toString().trim());
+      const colIdx     = headers.findIndex(h => h.toLowerCase() === AUDIT_CONFIG.COMPANY_COL.toLowerCase());
+      const useIdx     = colIdx !== -1 ? colIdx : 0;
+
+      for (let i = 1; i < data.length; i++) {
+        const name = (data[i][useIdx] || '').toString().trim().toLowerCase();
+        if (name) excludeSet.add(name);
+      }
+    }
+  }
+
+  // Count matching rows
+  let excludedCount = 0;
+  rows.forEach(row => {
+    const company = (row[companyIdx] || '').toString().trim().toLowerCase();
+    if (company && excludeSet.has(company)) excludedCount++;
+  });
+
+  return {
+    excludedCount,
+    excludeListSize: excludeSet.size,
+    excludeSet
+  };
+}
+
+// =============================================================================
+// UNIQUE AND NOT EXCLUDED COUNT
+// =============================================================================
+
+/**
+ * Counts rows that are UNIQUE (not a duplicate) AND NOT excluded.
+ * This is the true expected count in the Validation tab.
+ *
+ * A row is included in the count if:
+ *   - Its composite key appears for the FIRST TIME in the data
+ *   - Its company name is NOT in the exclude list
+ */
+function countUniqueAndNotExcluded(rows, fullNameIdx, companyIdx, email1Idx, excludeSet) {
+  const seen  = new Set();
+  let   count = 0;
+
+  rows.forEach(row => {
+    const name    = fullNameIdx !== -1 ? (row[fullNameIdx] || '').toString().trim().toLowerCase() : '';
+    const company = normalizeCompanyForAudit(row[companyIdx]);
+    const email   = email1Idx  !== -1 ? (row[email1Idx]   || '').toString().trim().toLowerCase() : '';
+    const companyRaw = (row[companyIdx] || '').toString().trim().toLowerCase();
+
+    // Build composite key (same logic as countDuplicates)
+    let key;
+    if (name && company && email) key = `${name}|${company}|${email}`;
+    else if (name && company)     key = `${name}|${company}`;
+    else if (company && email)    key = `${company}|${email}`;
+    else if (company)             key = company;
+    else                          key = `${name}|${company}|${email}`;
+
+    if (seen.has(key)) return; // duplicate — skip
+    seen.add(key);
+
+    if (excludeSet.size > 0 && companyRaw && excludeSet.has(companyRaw)) return; // excluded — skip
+
+    count++;
+  });
+
+  return count;
+}
+
+// =============================================================================
+// HELPER
+// =============================================================================
+
+function normalizeCompanyForAudit(name) {
+  if (!name) return '';
+  return name.toString()
+    .toLowerCase()
+    .trim()
+    .replace(/[.,\-\/\\&]/g, ' ')
+    .replace(/\b(llc|inc|corp|ltd|co|company|group|associates|services|solutions)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// =============================================================================
+// WRITE AUDIT REPORT SHEET
+// =============================================================================
+
+/**
+ * Creates or overwrites the Audit Report tab with a formatted summary.
+ */
+function writeAuditReport(ss, stats) {
+  const existing = ss.getSheetByName(AUDIT_CONFIG.AUDIT_SHEET);
+  if (existing) ss.deleteSheet(existing);
+
+  const sheet = ss.insertSheet(AUDIT_CONFIG.AUDIT_SHEET);
+
+  // Set column widths
+  sheet.setColumnWidth(1, 300);
+  sheet.setColumnWidth(2, 140);
+  sheet.setColumnWidth(3, 280);
+
+  let currentRow = 1;
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  currentRow = writeAuditHeader(sheet, currentRow,
+    '📊 DATA PIPELINE AUDIT REPORT',
+    `Generated: ${new Date().toLocaleString()}`
+  );
+  currentRow++;
+
+  // ── Section 1: Raw Data ───────────────────────────────────────────────────
+  currentRow = writeAuditSectionHeader(sheet, currentRow, '📥 RAW DATA');
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Total rows in Raw Data', stats.totalRaw, 'Starting point', false);
+  currentRow++;
+
+  // ── Section 2: Duplicate Analysis ────────────────────────────────────────
+  currentRow = writeAuditSectionHeader(sheet, currentRow, '🔁 DUPLICATE ANALYSIS');
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Duplicate rows found', stats.duplicateCount,
+    'Would be removed by pipeline dedup', false);
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Unique rows (after dedup)', stats.uniqueAfterDedup,
+    `${stats.totalRaw} − ${stats.duplicateCount}`, false);
+
+  // Breakdown by key type
+  if (stats.dupBreakdown && Object.keys(stats.dupBreakdown.byKey).length > 0) {
+    for (const [keyType, count] of Object.entries(stats.dupBreakdown.byKey)) {
+      currentRow = writeAuditRow(sheet, currentRow,
+        `  • Matched by: ${keyType}`, count, '', false);
+    }
+  }
+  currentRow++;
+
+  // ── Section 3: Company Exclusions ────────────────────────────────────────
+  currentRow = writeAuditSectionHeader(sheet, currentRow, '🚫 COMPANY EXCLUSIONS');
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Companies in Exclude list', stats.excludeListSize,
+    stats.excludeListSize === 0 ? 'Exclude tab is empty or missing' : 'Unique company names', false);
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Rows matching Exclude list', stats.excludedCount,
+    'Would be removed by Exclude Companies', false);
+  currentRow++;
+
+  // ── Section 4: Expected vs Actual ────────────────────────────────────────
+  currentRow = writeAuditSectionHeader(sheet, currentRow, '✅ EXPECTED vs ACTUAL');
+
+  // Formula row — highlighted
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Expected unique contacts',
+    stats.expectedUnique,
+    `${stats.totalRaw} − ${stats.duplicateCount} duplicates − ${stats.excludedCount} excluded`,
+    true  // highlight
+  );
+
+  const validationLabel = stats.validationMissing
+    ? `⚠️ "${AUDIT_CONFIG.VALIDATION_SHEET}" tab not found`
+    : 'Actual rows in Validation tab';
+
+  currentRow = writeAuditRow(sheet, currentRow,
+    'Actual rows in Validation', stats.validationMissing ? '—' : stats.actualValidation,
+    validationLabel, true);
+
+  // Difference row — green if 0, red if not
+  const diffValue   = stats.validationMissing ? '—' : stats.difference;
+  const diffNote    = stats.validationMissing
+    ? 'Cannot compare — Validation tab not found'
+    : stats.difference === 0
+      ? '✅ Expected matches actual'
+      : stats.difference > 0
+        ? `⚠️ Validation has ${stats.difference} MORE rows than expected`
+        : `⚠️ Validation has ${Math.abs(stats.difference)} FEWER rows than expected`;
+
+  const diffBg = stats.validationMissing ? AUDIT_CONFIG.LABEL_BG
+    : stats.difference === 0 ? AUDIT_CONFIG.MATCH_BG : AUDIT_CONFIG.MISMATCH_BG;
+
+  sheet.getRange(currentRow, 1).setValue('Difference');
+  sheet.getRange(currentRow, 2).setValue(diffValue);
+  sheet.getRange(currentRow, 3).setValue(diffNote);
+  sheet.getRange(currentRow, 1, 1, 3)
+    .setBackground(diffBg)
+    .setFontWeight('bold');
+  sheet.setRowHeight(currentRow, 28);
+  currentRow += 2;
+
+  // ── Section 5: Math summary ───────────────────────────────────────────────
+  currentRow = writeAuditSectionHeader(sheet, currentRow, '🧮 PIPELINE MATH');
+  sheet.getRange(currentRow, 1).setValue(
+    `${stats.totalRaw} (raw)  −  ${stats.duplicateCount} (dupes)  −  ${stats.excludedCount} (excluded)  =  ${stats.expectedUnique} (expected unique)`
+  );
+  sheet.getRange(currentRow, 1, 1, 3).merge()
+    .setFontSize(11)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setBackground(AUDIT_CONFIG.HIGHLIGHT_BG);
+  sheet.setRowHeight(currentRow, 32);
+
+  // Final formatting
+  sheet.setFrozenRows(0);
+  Logger.log('✓ Audit Report written');
+}
+
+// =============================================================================
+// AUDIT SHEET WRITING HELPERS
+// =============================================================================
+
+function writeAuditHeader(sheet, row, title, subtitle) {
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue(title)
+    .setFontSize(14)
+    .setFontWeight('bold')
+    .setBackground(AUDIT_CONFIG.HEADER_BG)
+    .setFontColor('#ffffff')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(row, 40);
+  row++;
+
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue(subtitle)
+    .setFontSize(10)
+    .setFontStyle('italic')
+    .setHorizontalAlignment('center')
+    .setBackground(AUDIT_CONFIG.LABEL_BG);
+  sheet.setRowHeight(row, 22);
+  row++;
+
+  return row;
+}
+
+function writeAuditSectionHeader(sheet, row, title) {
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue(title)
+    .setFontSize(12)
+    .setFontWeight('bold')
+    .setBackground(AUDIT_CONFIG.HEADER_BG)
+    .setFontColor('#ffffff')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(row, 32);
+
+  // Column labels
+  row++;
+  sheet.getRange(row, 1, 1, 3)
+    .setValues([['Metric', 'Count', 'Notes']])
+    .setFontWeight('bold')
+    .setBackground(AUDIT_CONFIG.LABEL_BG)
+    .setHorizontalAlignment('center');
+  sheet.setRowHeight(row, 22);
+  row++;
+
+  return row;
+}
+
+function writeAuditRow(sheet, row, label, value, notes, highlight) {
+  sheet.getRange(row, 1).setValue(label);
+  sheet.getRange(row, 2).setValue(value);
+  sheet.getRange(row, 3).setValue(notes);
+
+  sheet.getRange(row, 2).setHorizontalAlignment('center');
+
+  if (highlight) {
+    sheet.getRange(row, 1, 1, 3).setBackground(AUDIT_CONFIG.HIGHLIGHT_BG);
+    sheet.getRange(row, 1, 1, 3).setFontWeight('bold');
+  } else {
+    sheet.getRange(row, 1, 1, 3).setBackground(AUDIT_CONFIG.WHITE);
+  }
+
+  sheet.setRowHeight(row, 24);
+  return row + 1;
+}
+
+// =============================================================================
+// END OF SCRIPT
+// =============================================================================
