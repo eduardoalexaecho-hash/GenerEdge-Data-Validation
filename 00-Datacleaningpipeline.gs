@@ -1,62 +1,49 @@
 /**
  * =============================================================================
- * DATA CLEANING PIPELINE V3 - Production-Ready Google Sheets Apps Script
+ * DATA CLEANING PIPELINE V5
  * =============================================================================
- * 
- * VERSION 3.4 MENU UPDATE:
- * - ADDED: Pipeline Dashboard integration in onOpen menu
- * - NEW: 📊 View Pipeline Dashboard option at top of menu
- * - Dashboard shows: cleaning stats, CRM Ready stats, categorization, overall conversion
- * - REQUIRES: PipelineDashboard.gs file to be added separately
- * 
- * VERSION 3.3 CRITICAL FIX:
- * - FIXED: Duplicate detection was treating different people at same company as duplicates
- * - ROOT CAUSE: When Contact Full Name had whitespace, it didn't check First+Last name
- * - SOLUTION: Now checks if Contact Full Name is non-empty after trim, falls back to First+Last
- * 
- * EXAMPLE BUG (BEFORE FIX):
- * - Marty Helgerson | Frase Construction | frase.com
- * - Jeremy Frase | Frase Construction | frase.com
- * ❌ Were marked as duplicates (Match: "Company + Website")
- * ✅ Now correctly kept as separate contacts (Match: "Name + Company + Website")
- * 
- * VERSION 3.2 CRITICAL FIX:
- * - FIXED: Duplicate detection now uses First Name + Last Name when Contact Full Name is empty
- * - BEFORE: Would treat all contacts from same company as duplicates if no Contact Full Name
- * - AFTER: Uses First + Last name to distinguish different people from same company
- * 
- * VERSION 3 UPDATES (Critical Fix):
- * - Row-level duplicate detection: Uses COMPOSITE KEY (Name + Company + Website)
- * - Column-level deduplication: ONLY applies to Email and Phone columns
- * - Organization, Website, City, Description: NO duplicate removal (preserved as-is)
- * 
- * DUPLICATE DETECTION LOGIC (UPDATED):
- * - Priority 1: Contact Full Name + Company + Website (if Contact Full Name non-empty)
- * - Priority 2: First Name + Last Name + Company + Website (if Contact Full Name empty)
- * - Priority 3: First Name + Last Name + Company (no website)
- * - Fallback: Company + Website (ONLY if NO name data at all)
- * 
- * Example - NOT duplicates (different people, same company):
- * - Marty Helgerson | Frase Construction | frase.com
- * - Jeremy Frase | Frase Construction | frase.com  ← DIFFERENT PERSON, NOT DUPLICATE!
- * 
- * Example - ARE duplicates (same person, same company):
- * - David Gordon | Aspire Fine Homes | aspire.com
- * - David Gordon | Aspire Fine Homes | aspire.com  ← DUPLICATE ROW
- * 
+ *
+ * VERSION 5.0 CHANGES:
+ * - Critical column changed from "Company Name - Cleaned" to "Company Name"
+ * - New columns added to output: Address 1, Address 2, County, Zip,
+ *   Gender, Race/Ethnicity, Industry, Company State
+ * - Pre-run rename warning: detects common column name variants and tells
+ *   you exactly which columns to rename before running
+ * - Step 6.5: Gender normalized to lowercase (Male → male, Female → female)
+ * - Step 6.5: Race/Ethnicity normalized to lowercase;
+ *   "Asian/Pacific American" → "asian" (special case)
+ * - Columns that need renaming:
+ *     Contact Name    → Contact Full Name
+ *     Contact Email   → Email 1
+ *     Contact Phone   → Contact Mobile Phone
+ *     City            → Company City
+ *     State           → Company State
+ * - Duplicate key: Contact Full Name + Company Name + Email 1
+ * - Cross-row Email 1 safety net retained
+ * - Company name normalization retained (strips punctuation, LLC/Inc/etc.)
+ * - Phone normalization retained (digits only, strips leading US country code)
+ * - Primary Email removed from all logic
+ *
  * REQUIRED COLUMNS:
- * - Company Name - Cleaned (CRITICAL - must exist)
- * 
- * OPTIONAL COLUMNS:
- * - Contact Full Name, First Name, Last Name (at least one recommended)
- * - Website, Email columns, Phone columns, Company Description, Company City
- * 
- * OUTPUT BEHAVIOR:
- * - If Contact Full Name exists → Output includes: Contact Full Name, First Name, Last Name
- * - If Contact Full Name missing → Output includes: First Name, Last Name (if they exist)
- * 
+ *   - Company Name (CRITICAL)
+ *
+ * OPTIONAL COLUMNS (preserved in output if present):
+ *   - Contact Full Name
+ *   - Email 1, Email 2, Personal Email
+ *   - Contact Mobile Phone, Contact Phone 1, Company Phone 1, Company Phone 2
+ *   - Address 1, Address 2, Company City, Company State, County, Zip
+ *   - Gender, Race/Ethnicity, Industry
+ *   - Website, Company Description
+ *
+ * COLUMNS THAT NEED RENAMING BEFORE RUNNING:
+ *   Contact Name    → Contact Full Name
+ *   Contact Email   → Email 1
+ *   Contact Phone   → Contact Mobile Phone
+ *   City            → Company City
+ *   State           → Company State
+ *
  * @author: Claude
- * @version: 3.3 - CRITICAL FIX: Different people at same company no longer treated as duplicates
+ * @version: 5.0
  */
 
 // =============================================================================
@@ -64,29 +51,43 @@
 // =============================================================================
 
 const CONFIG = {
-  // Sheet names
   OUTPUT_SHEET_NAME: 'Cleaned Data V3',
-  
-  // Columns to process (by header name)
+
   COLUMNS: {
-    FULL_NAME: 'Contact Full Name',
-    FIRST_NAME: 'First Name',  // Added
-    LAST_NAME: 'Last Name',    // Added
-    ORGANIZATION: 'Company Name - Cleaned',  // Source column name
-    WEBSITE: 'Website',
-    PRIMARY_EMAIL: 'Primary Email',
-    EMAIL_1: 'Email 1',
-    EMAIL_2: 'Email 2',
-    PERSONAL_EMAIL: 'Personal Email',
+    FULL_NAME:       'Contact Full Name',
+    FIRST_NAME:      'First Name',
+    LAST_NAME:       'Last Name',
+    ORGANIZATION:    'Company Name',
+    EMAIL_1:         'Email 1',
+    EMAIL_2:         'Email 2',
+    PERSONAL_EMAIL:  'Personal Email',
+    CONTACT_MOBILE:  'Contact Mobile Phone',
     CONTACT_PHONE_1: 'Contact Phone 1',
     COMPANY_PHONE_1: 'Company Phone 1',
     COMPANY_PHONE_2: 'Company Phone 2',
-    CONTACT_MOBILE: 'Contact Mobile Phone',
-    COMPANY_CITY: 'Company City',
-    COMPANY_DESC: 'Company Description'
+    ADDRESS_1:       'Address 1',
+    ADDRESS_2:       'Address 2',
+    COMPANY_CITY:    'Company City',
+    COMPANY_STATE:   'Company State',
+    COUNTY:          'County',
+    ZIP:             'Zip',
+    GENDER:          'Gender',
+    RACE_ETHNICITY:  'Race/Ethnicity',
+    INDUSTRY:        'Industry',
+    WEBSITE:         'Website',
+    COMPANY_DESC:    'Company Description'
   },
-  
-  // Performance settings
+
+  // Columns the user might have that need to be renamed before running.
+  // Key = what we detect in their sheet, Value = what it should be renamed to.
+  RENAME_REQUIRED: {
+    'Contact Name':  'Contact Full Name',
+    'Contact Email': 'Email 1',
+    'Contact Phone': 'Contact Mobile Phone',
+    'City':          'Company City',
+    'State':         'Company State'
+  },
+
   BATCH_SIZE: 1000
 };
 
@@ -94,123 +95,110 @@ const CONFIG = {
 // MAIN EXECUTION
 // =============================================================================
 
-/**
- * Main entry point for the data cleaning pipeline V3
- */
 function runDataCleaningPipelineV3() {
   try {
     const startTime = new Date();
-    Logger.log('=== Starting Data Cleaning Pipeline V3 ===');
-    
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    Logger.log('=== Starting Data Cleaning Pipeline V5 ===');
+
+    const ss          = SpreadsheetApp.getActiveSpreadsheet();
     const sourceSheet = ss.getActiveSheet();
-    
+
+    // Step 0: Check for columns that need renaming before anything else
+    Logger.log('Step 0: Checking for columns that need renaming...');
+    if (!checkForRenameRequired(sourceSheet)) {
+      return; // User was shown the warning — stop here
+    }
+
     Logger.log('Validating source sheet...');
-    
-    // Validate source sheet
     if (!validateSourceSheet(sourceSheet)) {
       throw new Error('Source sheet validation failed. Check required columns.');
     }
-    
     Logger.log('✓ Validation passed');
-    
-    // Step 1: Load and parse data
+
+    // Step 1: Load data
     Logger.log('Step 1: Loading data...');
-    const rawData = loadSheetData(sourceSheet);
+    const rawData          = loadSheetData(sourceSheet);
     const originalRowCount = rawData.data.length;
-    
-    // Step 2: V3 UPDATED - Remove duplicate ROWS using composite key
-    Logger.log('Step 2: Removing duplicate rows (by Name + Company + Website)...');
+
+    // Step 2: Remove duplicate rows
+    Logger.log('Step 2: Removing duplicate rows...');
     const uniqueRowsData = removeDuplicateRows(rawData);
-    const removedRows = originalRowCount - uniqueRowsData.data.length;
+    const removedRows    = originalRowCount - uniqueRowsData.data.length;
     Logger.log(`Removed ${removedRows} duplicate rows`);
-    
-    // Step 3: V3 UPDATED - Clean duplicates ONLY within Phone columns
-    Logger.log('Step 3: Cleaning duplicates within Phone columns...');
+
+    // Step 3: Clean duplicate phone numbers within each row
+    Logger.log('Step 3: Cleaning duplicate phones within rows...');
     const cleanedData = cleanEmailPhoneDuplicates(uniqueRowsData);
-    
-    // Step 4: REMOVED - Email consolidation now happens ONLY in Step 5 for duplicates
-    // No longer moves Primary → Email 1 when Email 1 is empty
-    // Only consolidates actual duplicates
-    Logger.log('Step 4: Skipped (consolidation only for duplicates in Step 5)');
-    const emailFilledData = cleanedData;  // Pass through unchanged
-    
-    // Step 5: Deduplicate and normalize emails
+
+    // Step 4: Skipped (Primary Email removed)
+    Logger.log('Step 4: Skipped (Primary Email removed from pipeline)');
+    const emailFilledData = cleanedData;
+
+    // Step 5: Deduplicate emails within each row
     Logger.log('Step 5: Deduplicating emails...');
     const emailCleanedData = deduplicateEmails(emailFilledData);
-    
-    // Step 6: Deduplicate and normalize phones with priority
+
+    // Step 6: Deduplicate and normalize phones with mobile priority
     Logger.log('Step 6: Deduplicating phones (Mobile priority)...');
     const phoneCleanedData = deduplicatePhonesWithPriority(emailCleanedData);
-    
+
+    // Step 6.5: Normalize Gender and Race/Ethnicity values
+    Logger.log('Step 6.5: Normalizing Gender and Race/Ethnicity...');
+    const normalizedData = normalizeFieldValues(phoneCleanedData);
+
     // Step 7: Parse names
     Logger.log('Step 7: Parsing names...');
-    const finalData = parseNames(phoneCleanedData);
-    
+    const finalData = parseNames(normalizedData);
+
     // Step 8: Create output sheet
     Logger.log('Step 8: Creating output sheet...');
     const outputSheet = createOutputSheet(ss, sourceSheet);
-    
-    // Step 9: Write data to output
+
+    // Step 9: Write cleaned data
     Logger.log('Step 9: Writing cleaned data...');
     writeOutputData(outputSheet, finalData, sourceSheet.getName());
-    
+
     // Step 10: Create duplicates report
     Logger.log('Step 10: Creating duplicates report...');
-    const duplicatesSheet = createDuplicatesReport(ss, uniqueRowsData.duplicates);
-    
-    // Step 11: Add validation formula - REMOVED (causes timeout)
-    // Logger.log('Step 11: Adding validation formula...');
-    // addValidationFormula(outputSheet, sourceSheet.getName());
-    
-    const endTime = new Date();
-    const duration = (endTime - startTime) / 1000;
-    
-    Logger.log(`=== Pipeline V3 Complete in ${duration}s ===`);
-    Logger.log(`Original rows: ${originalRowCount}`);
-    Logger.log(`Removed duplicate rows: ${removedRows}`);
-    Logger.log(`Duplicates tracked: ${uniqueRowsData.duplicates.length}`);
-    Logger.log(`Final rows: ${finalData.data.length}`);
-    
-    // Build column summary
-    const validation = CONFIG._VALIDATION_RESULTS || {};
-    const foundOptional = validation.foundOptional || [];
+    createDuplicatesReport(ss, uniqueRowsData.duplicates);
+
+    const duration = ((new Date() - startTime) / 1000).toFixed(2);
+    Logger.log(`=== Pipeline V5 Complete in ${duration}s ===`);
+
+    const validation      = CONFIG._VALIDATION_RESULTS || {};
+    const foundOptional   = validation.foundOptional   || [];
     const skippedOptional = validation.skippedOptional || [];
-    
+
     let columnSummary = '';
     if (foundOptional.length > 0) {
-      columnSummary += `\n✓ Processed columns:\n`;
-      columnSummary += foundOptional.map(col => `  • ${col}`).join('\n');
+      columnSummary += `\n✓ Processed columns:\n` + foundOptional.map(c => `  • ${c}`).join('\n');
     }
     if (skippedOptional.length > 0) {
-      columnSummary += `\n\n⊗ Skipped columns (not found):\n`;
-      columnSummary += skippedOptional.map(col => `  • ${col}`).join('\n');
+      columnSummary += `\n\n⊗ Skipped (not found):\n` + skippedOptional.map(c => `  • ${c}`).join('\n');
     }
-    
+
     SpreadsheetApp.getUi().alert(
-      'Success! (Version 3)',
-      `✅ Data cleaning complete!\n\n` +
+      '✅ Data Cleaning Complete (V5)',
       `📊 Results:\n` +
-      `Original rows: ${originalRowCount}\n` +
-      `Duplicate rows removed: ${removedRows}\n` +
-      `Final rows: ${finalData.data.length}\n` +
-      `Duration: ${duration.toFixed(2)}s\n\n` +
+      `  Original rows:          ${originalRowCount}\n` +
+      `  Duplicate rows removed: ${removedRows}\n` +
+      `  Final rows:             ${finalData.data.length}\n` +
+      `  Duration:               ${duration}s\n\n` +
       `📄 Output Sheets:\n` +
-      `  • "${CONFIG.OUTPUT_SHEET_NAME}" - Cleaned data\n` +
-      `  • "Duplicates Report" - ${uniqueRowsData.duplicates.length} duplicates found\n` +
+      `  • "${CONFIG.OUTPUT_SHEET_NAME}" — Cleaned data\n` +
+      `  • "Duplicates Report" — ${uniqueRowsData.duplicates.length} duplicates found\n` +
       columnSummary + `\n\n` +
       `✓ Duplicate Detection:\n` +
-      `  • Composite key: Name + Company + Website\n` +
-      `  • Row is duplicate only if ALL match\n\n` +
-      `✓ Deduplication:\n` +
-      `  • Organization/Website preserved\n` +
-      `  • Emails/Phones deduplicated within each row`,
+      `  • Key: Contact Full Name + Company Name + Email 1\n` +
+      `  • Cross-row Email 1 safety net enabled\n` +
+      `  • Company name punctuation-normalized before compare\n\n` +
+      `✓ Phone Normalization:\n` +
+      `  • All non-digits stripped for comparison\n` +
+      `  • Leading US country code (1) stripped\n` +
+      `  • Mobile phone has highest priority`,
       SpreadsheetApp.getUi().ButtonSet.OK
     );
-    
-    // Explicit return to stop execution immediately after showing alert
-    return;
-    
+
   } catch (error) {
     Logger.log('ERROR: ' + error.toString());
     SpreadsheetApp.getUi().alert(
@@ -218,505 +206,394 @@ function runDataCleaningPipelineV3() {
       'Pipeline failed: ' + error.toString(),
       SpreadsheetApp.getUi().ButtonSet.OK
     );
-    
-    // Explicit return to stop execution immediately after error alert
     return;
   }
 }
 
 // =============================================================================
-// STEP 1: DATA LOADING
+// STEP 0: PRE-RUN RENAME CHECK
 // =============================================================================
 
 /**
- * Validates that the source sheet contains required columns
- * STRICT matching - columns must have exact names
- * - Critical columns: Show warning to rename
- * - Optional columns: Skip silently if missing
+ * Checks if any columns in the sheet need to be renamed before running.
+ * Shows a clear warning with exact rename instructions if any are found.
+ * Returns true if it's safe to continue, false if renaming is required.
+ *
+ * @param {Sheet} sheet
+ * @returns {boolean} true = ok to proceed, false = stop and rename first
  */
+function checkForRenameRequired(sheet) {
+  const headers       = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const headersNormal = headers.map(h => h.toString().trim());
+
+  const detected = []; // [{ found, renameTo }]
+
+  for (const [colName, renameTo] of Object.entries(CONFIG.RENAME_REQUIRED)) {
+    if (headersNormal.includes(colName)) {
+      detected.push({ found: colName, renameTo });
+    }
+  }
+
+  if (detected.length === 0) {
+    Logger.log('✓ No column renaming required');
+    return true; // All good
+  }
+
+  // Build warning message
+  const renameList = detected
+    .map(d => `  • "${d.found}"  →  "${d.renameTo}"`)
+    .join('\n');
+
+  SpreadsheetApp.getUi().alert(
+    '⚠️ Column Rename Required Before Running',
+    'The following columns need to be renamed before running the pipeline.\n' +
+    'Please rename them in your sheet, then run the pipeline again.\n\n' +
+    'Columns to rename:\n' +
+    renameList + '\n\n' +
+    'Why? The pipeline uses standardized column names to process your data correctly.\n\n' +
+    'How to rename:\n' +
+    '  1. Click the column header cell\n' +
+    '  2. Type the new name exactly as shown above\n' +
+    '  3. Press Enter\n' +
+    '  4. Run the pipeline again',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+
+  Logger.log(`Rename required: ${detected.map(d => `"${d.found}" → "${d.renameTo}"`).join(', ')}`);
+  return false; // Stop — user must rename first
+}
+
+// =============================================================================
+// STEP 1: DATA LOADING & VALIDATION
+// =============================================================================
+
 function validateSourceSheet(sheet) {
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  
-  // Define column requirements
+
   const columnRequirements = {
-    // CRITICAL - Must exist with exact name
     critical: {
-      'Company Name - Cleaned': 'Company Name - Cleaned'  // Must be exactly this!
+      'Company Name': 'Company Name'
     },
-    
-    // OPTIONAL - Skip if missing
     optional: {
-      'Contact Full Name': 'Contact Full Name',  // Now optional!
-      'First Name': 'First Name',  // Added
-      'Last Name': 'Last Name',    // Added
-      'Website': 'Website',
-      'Primary Email': 'Primary Email',
-      'Email 1': 'Email 1',
-      'Email 2': 'Email 2',
-      'Personal Email': 'Personal Email',
-      'Contact Phone 1': 'Contact Phone 1',
-      'Company Phone 1': 'Company Phone 1',
-      'Company Phone 2': 'Company Phone 2',
+      'Contact Full Name':    'Contact Full Name',
+      'First Name':           'First Name',
+      'Last Name':            'Last Name',
+      'Email 1':              'Email 1',
+      'Email 2':              'Email 2',
+      'Personal Email':       'Personal Email',
       'Contact Mobile Phone': 'Contact Mobile Phone',
-      'Company Description': 'Company Description',
-      'Company City': 'Company City'
+      'Contact Phone 1':      'Contact Phone 1',
+      'Company Phone 1':      'Company Phone 1',
+      'Company Phone 2':      'Company Phone 2',
+      'Address 1':            'Address 1',
+      'Address 2':            'Address 2',
+      'Company City':         'Company City',
+      'Company State':        'Company State',
+      'County':               'County',
+      'Zip':                  'Zip',
+      'Gender':               'Gender',
+      'Race/Ethnicity':       'Race/Ethnicity',
+      'Industry':             'Industry',
+      'Website':              'Website',
+      'Company Description':  'Company Description'
     }
   };
-  
-  // Check critical columns
+
   const missingCritical = [];
-  const foundColumns = {};
-  
+  const foundColumns    = {};
+
+  // Normalize headers once for all comparisons
+  const normalizedHeaders = headers.map(h => h.toString().trim().toLowerCase());
+
   for (const [colName, exactName] of Object.entries(columnRequirements.critical)) {
-    if (headers.includes(exactName)) {
-      foundColumns[colName] = exactName;
+    const matchIdx = normalizedHeaders.indexOf(exactName.toLowerCase());
+    if (matchIdx !== -1) {
+      foundColumns[colName] = headers[matchIdx].toString().trim();
     } else {
       missingCritical.push(exactName);
     }
   }
-  
-  // If critical columns missing, show warning with rename instructions
+
   if (missingCritical.length > 0) {
-    const warningMessage = 
-      '⚠️ CRITICAL COLUMNS MISSING ⚠️\n\n' +
-      'The following columns are required with EXACT names:\n' +
-      missingCritical.map(col => `  • "${col}"`).join('\n') + '\n\n' +
-      'Please rename your columns to match exactly.\n\n' +
-      'Available headers in your sheet:\n' +
-      headers.join(', ') + '\n\n' +
-      'IMPORTANT: "Company Name - Cleaned" must be exactly that name,\n' +
-      'including the " - Cleaned" part.';
-    
-    Logger.log('❌ ' + warningMessage);
     SpreadsheetApp.getUi().alert(
       '⚠️ Critical Columns Missing',
-      warningMessage,
+      '⚠️ CRITICAL COLUMNS MISSING ⚠️\n\n' +
+      'The following columns are required with EXACT names:\n' +
+      missingCritical.map(c => `  • "${c}"`).join('\n') + '\n\n' +
+      'Available headers in your sheet:\n' +
+      headers.map(h => h.toString().trim()).filter(Boolean).join(', '),
       SpreadsheetApp.getUi().ButtonSet.OK
     );
     return false;
   }
-  
-  // Check optional columns (just log, don't fail)
-  const foundOptional = [];
+
+  const foundOptional   = [];
   const skippedOptional = [];
-  
+
+  // Normalize headers for case-insensitive, trimmed matching
+  const headersNormalized = headers.map(h => h.toString().trim().toLowerCase());
+
   for (const [colName, exactName] of Object.entries(columnRequirements.optional)) {
-    if (headers.includes(exactName)) {
-      foundColumns[colName] = exactName;
-      foundOptional.push(exactName);
+    const matchIdx = headersNormalized.indexOf(exactName.toLowerCase());
+    if (matchIdx !== -1) {
+      // Use the actual header value from the sheet (preserves original casing)
+      const actualName = headers[matchIdx].toString().trim();
+      foundColumns[colName] = actualName;
+      foundOptional.push(actualName);
     } else {
       skippedOptional.push(exactName);
     }
   }
-  
-  // Store results for summary
-  CONFIG._VALIDATION_RESULTS = {
-    foundOptional: foundOptional,
-    skippedOptional: skippedOptional,
-    foundColumns: foundColumns
-  };
-  
-  Logger.log(`✅ Validation complete: ${foundOptional.length} optional columns found, ${skippedOptional.length} skipped`);
+
+  CONFIG._VALIDATION_RESULTS = { foundOptional, skippedOptional, foundColumns };
+  Logger.log(`✅ Validation: ${foundOptional.length} optional columns found, ${skippedOptional.length} skipped`);
   return true;
 }
 
-/**
- * Loads data from sheet and creates a structured object
- * Only processes columns that were found during validation
- */
 function loadSheetData(sheet) {
   const lastRow = sheet.getLastRow();
   const lastCol = sheet.getLastColumn();
-  
-  if (lastRow < 2) {
-    throw new Error('No data rows found in sheet');
-  }
-  
-  // Get all data including headers
-  const allData = sheet.getRange(1, 1, lastRow, lastCol).getValues();
-  const headers = allData[0];
-  const dataRows = allData.slice(1);
-  
-  // Create column index map ONLY for columns that were found
+  if (lastRow < 2) throw new Error('No data rows found in sheet');
+
+  const allData   = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers   = allData[0];
+  const dataRows  = allData.slice(1);
   const columnMap = {};
-  
+
   if (CONFIG._VALIDATION_RESULTS && CONFIG._VALIDATION_RESULTS.foundColumns) {
-    // Map only the columns that exist
-    for (const [standardName, actualName] of Object.entries(CONFIG._VALIDATION_RESULTS.foundColumns)) {
+    for (const [, actualName] of Object.entries(CONFIG._VALIDATION_RESULTS.foundColumns)) {
       const index = headers.indexOf(actualName);
-      if (index !== -1) {
-        columnMap[actualName] = index;
-      }
+      if (index !== -1) columnMap[actualName] = index;
     }
   } else {
-    // Fallback: map all headers
-    headers.forEach((header, index) => {
-      columnMap[header] = index;
-    });
+    headers.forEach((header, index) => { columnMap[header] = index; });
   }
-  
-  Logger.log(`Column map created with ${Object.keys(columnMap).length} columns`);
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: dataRows
-  };
+
+  Logger.log(`Column map: ${Object.keys(columnMap).length} columns`);
+  return { headers, columnMap, data: dataRows };
 }
 
 // =============================================================================
-// STEP 2: ROW-LEVEL DUPLICATE REMOVAL (V3 NEW)
+// STEP 2: ROW-LEVEL DUPLICATE REMOVAL
 // =============================================================================
 
 /**
- * V3 UPDATED: Removes duplicate ROWS based on composite key:
- * - Contact Full Name + Company Name - Cleaned + Website (if all exist)
- * - Company Name - Cleaned + Website (if Contact Full Name missing)
- * - Falls back to Company + Description if Website missing
- * 
- * A row is considered a duplicate based on available fields:
- * 
- * Example - These are NOT duplicates (different companies):
- * - David Gordon | Aspire Fine Homes | aspire.com
- * - David Gordon | Whitestone Builders | whitestone.com
- * 
- * Example - These ARE duplicates (all fields match):
- * - David Gordon | Aspire Fine Homes | aspire.com
- * - David Gordon | Aspire Fine Homes | aspire.com  ← DUPLICATE
- * 
- * If no Contact Full Name column:
- * - ABC Company | abc.com
- * - ABC Company | abc.com  ← DUPLICATE (same company + website)
+ * Normalizes a company name for comparison.
+ * Strips punctuation and common legal suffixes so
+ * "ABC Builders LLC" and "ABC Builders" match as the same company.
+ */
+function normalizeCompanyName(name) {
+  if (!name) return '';
+  return name.toString()
+    .toLowerCase()
+    .trim()
+    .replace(/[.,\-\/\\&]/g, ' ')
+    .replace(/\b(llc|inc|corp|ltd|co|company|group|associates|services|solutions)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * V5: Duplicate key is Contact Full Name + Company Name + Email 1.
+ * Falls back to simpler keys when fields are missing.
+ * Followed by a cross-row Email 1 safety net pass.
  */
 function removeDuplicateRows(dataObject) {
   const { headers, columnMap, data } = dataObject;
-  
-  const fullNameIdx = columnMap[CONFIG.COLUMNS.FULL_NAME];
-  const firstNameIdx = columnMap[CONFIG.COLUMNS.FIRST_NAME];
-  const lastNameIdx = columnMap[CONFIG.COLUMNS.LAST_NAME];
+
+  const fullNameIdx    = columnMap[CONFIG.COLUMNS.FULL_NAME];
   const companyNameIdx = columnMap[CONFIG.COLUMNS.ORGANIZATION];
-  const websiteIdx = columnMap[CONFIG.COLUMNS.WEBSITE];
+  const email1Idx      = columnMap[CONFIG.COLUMNS.EMAIL_1];
   const descriptionIdx = columnMap[CONFIG.COLUMNS.COMPANY_DESC];
-  
-  const seenCombinations = new Map(); // Changed to Map to track first occurrence row
-  const uniqueRows = [];
-  const duplicates = []; // Track duplicate information
-  
+  const websiteIdx     = columnMap[CONFIG.COLUMNS.WEBSITE];
+
+  const seenCombinations = new Map();
+  const uniqueRows       = [];
+  const duplicates       = [];
+
   data.forEach((row, index) => {
-    // CRITICAL FIX: Build name from Contact Full Name OR First + Last Name
-    let nameForKey = '';
-    
-    // Priority 1: Use Contact Full Name if it exists and has NON-EMPTY value
-    if (fullNameIdx !== undefined && row[fullNameIdx]) {
-      const fullNameValue = row[fullNameIdx].toString().trim();
-      if (fullNameValue) {
-        // Contact Full Name has actual content
-        nameForKey = fullNameValue;
-      }
-    }
-    
-    // Priority 2: Use First Name + Last Name if nameForKey is still empty
-    // This runs if: (a) Contact Full Name column doesn't exist, OR
-    //               (b) Contact Full Name is empty/whitespace
-    if (!nameForKey && (firstNameIdx !== undefined || lastNameIdx !== undefined)) {
-      const firstName = firstNameIdx !== undefined ? (row[firstNameIdx] || '').toString().trim() : '';
-      const lastName = lastNameIdx !== undefined ? (row[lastNameIdx] || '').toString().trim() : '';
-      // Combine First + Last (with space if both exist)
-      if (firstName && lastName) {
-        nameForKey = `${firstName} ${lastName}`;
-      } else if (firstName) {
-        nameForKey = firstName;
-      } else if (lastName) {
-        nameForKey = lastName;
-      }
-    }
-    
-    const companyName = row[companyNameIdx];
-    const website = websiteIdx !== undefined ? row[websiteIdx] : '';
-    const description = descriptionIdx !== undefined ? row[descriptionIdx] : '';
-    
-    // Normalize: trim and lowercase for comparison
-    const nameKey = nameForKey ? nameForKey.toLowerCase() : '';
-    const companyKey = companyName ? companyName.toString().trim().toLowerCase() : '';
-    const websiteKey = website ? website.toString().trim().toLowerCase() : '';
-    const descriptionKey = description ? description.toString().trim().toLowerCase() : '';
-    
-    // Create composite key based on available fields
-    let compositeKey;
-    let matchCriteria;
-    
-    if (nameKey && companyKey && websiteKey) {
-      // Standard 3-field key (Name + Company + Website)
-      compositeKey = `${nameKey}|${companyKey}|${websiteKey}`;
-      matchCriteria = 'Name + Company + Website';
+    const nameForKey     = fullNameIdx    !== undefined ? (row[fullNameIdx]    || '').toString().trim()           : '';
+    const companyRaw     = companyNameIdx !== undefined ? (row[companyNameIdx] || '').toString().trim()           : '';
+    const email1Key      = email1Idx      !== undefined ? (row[email1Idx]      || '').toString().trim().toLowerCase() : '';
+    const descriptionKey = descriptionIdx !== undefined ? (row[descriptionIdx] || '').toString().trim().toLowerCase() : '';
+    const websiteKey     = websiteIdx     !== undefined ? (row[websiteIdx]     || '').toString().trim().toLowerCase() : '';
+
+    const nameKey    = nameForKey.toLowerCase();
+    const companyKey = normalizeCompanyName(companyRaw);
+
+    // Build composite key — most specific first
+    let compositeKey, matchCriteria;
+
+    if (nameKey && companyKey && email1Key) {
+      compositeKey  = `${nameKey}|${companyKey}|${email1Key}`;
+      matchCriteria = 'Contact Name + Company + Email 1';
     } else if (nameKey && companyKey) {
-      // Name + Company (no website available)
-      compositeKey = `${nameKey}|${companyKey}`;
-      matchCriteria = 'Name + Company';
+      compositeKey  = `${nameKey}|${companyKey}`;
+      matchCriteria = 'Contact Name + Company';
+    } else if (companyKey && email1Key) {
+      compositeKey  = `${companyKey}|${email1Key}`;
+      matchCriteria = 'Company + Email 1';
     } else if (companyKey && websiteKey) {
-      // No name available: Company + Website only
-      compositeKey = `${companyKey}|${websiteKey}`;
+      compositeKey  = `${companyKey}|${websiteKey}`;
       matchCriteria = 'Company + Website';
     } else if (companyKey && descriptionKey) {
-      // No name or website: Company + Description
-      compositeKey = `${companyKey}|${descriptionKey}`;
+      compositeKey  = `${companyKey}|${descriptionKey}`;
       matchCriteria = 'Company + Description';
     } else if (companyKey) {
-      // Only company name available
-      compositeKey = `${companyKey}`;
+      compositeKey  = companyKey;
       matchCriteria = 'Company Name Only';
     } else {
-      // No reliable fields - include all available
-      compositeKey = `${nameKey}|${companyKey}|${websiteKey}|${descriptionKey}`;
+      compositeKey  = `${nameKey}|${companyKey}|${email1Key}`;
       matchCriteria = 'All Available Fields';
     }
-    
+
     if (seenCombinations.has(compositeKey)) {
-      // Duplicate found - track it
-      const originalRowNumber = seenCombinations.get(compositeKey);
       duplicates.push({
-        duplicateRowNumber: index + 2, // +2 because: +1 for header, +1 for 1-based indexing
-        originalRowNumber: originalRowNumber,
-        fullName: nameForKey,  // Use the constructed name
-        companyName: companyName,
-        website: website,
-        description: description,
-        matchCriteria: matchCriteria,
+        duplicateRowNumber: index + 2,
+        originalRowNumber:  seenCombinations.get(compositeKey),
+        fullName:           nameForKey,
+        companyName:        companyRaw,
+        email1:             email1Key,
+        website:            websiteKey,
+        description:        descriptionKey,
+        matchCriteria,
         rowData: row
       });
     } else {
-      // First occurrence - keep this row
-      seenCombinations.set(compositeKey, index + 2); // Store row number (+2 for sheet row number)
+      seenCombinations.set(compositeKey, index + 2);
       uniqueRows.push(row);
     }
   });
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: uniqueRows,
-    duplicates: duplicates  // Return duplicate info
-  };
+
+  // ── CROSS-ROW EMAIL SAFETY NET ──────────────────────────────────────────────
+  // After composite key dedup, flag any remaining rows that share Email 1.
+  const uniqueAfterEmailCheck = [];
+  const seenEmails            = new Map();
+
+  uniqueRows.forEach((row, index) => {
+    const email1 = email1Idx !== undefined
+      ? (row[email1Idx] || '').toString().trim().toLowerCase()
+      : '';
+
+    if (!email1) {
+      uniqueAfterEmailCheck.push(row);
+      return;
+    }
+
+    if (seenEmails.has(email1)) {
+      const nameForKey = fullNameIdx !== undefined
+        ? (row[fullNameIdx] || '').toString().trim()
+        : '';
+      const companyRaw = companyNameIdx !== undefined
+        ? (row[companyNameIdx] || '').toString().trim()
+        : '';
+      duplicates.push({
+        duplicateRowNumber: index + 2,
+        originalRowNumber:  seenEmails.get(email1),
+        fullName:           nameForKey,
+        companyName:        companyRaw,
+        email1,
+        website:            '',
+        description:        '',
+        matchCriteria:      'PROBABLE DUPLICATE — same Email 1',
+        rowData:            row
+      });
+    } else {
+      seenEmails.set(email1, index + 2);
+      uniqueAfterEmailCheck.push(row);
+    }
+  });
+  // ── END EMAIL SAFETY NET ────────────────────────────────────────────────────
+
+  Logger.log(`Composite key duplicates: ${data.length - uniqueRows.length}`);
+  Logger.log(`Email safety net duplicates: ${uniqueRows.length - uniqueAfterEmailCheck.length}`);
+  Logger.log(`Total removed: ${data.length - uniqueAfterEmailCheck.length}`);
+
+  return { headers, columnMap, data: uniqueAfterEmailCheck, duplicates };
 }
 
 // =============================================================================
-// STEP 3: COLUMN-LEVEL DUPLICATE CLEANING (V3 UPDATED)
+// STEP 3: COLUMN-LEVEL PHONE DUPLICATE CLEANING
 // =============================================================================
 
-/**
- * V3 UPDATED: Removes duplicate values ONLY within Phone columns
- * Emails are handled separately in Step 5 (deduplicateEmails)
- * Does NOT touch: Organization, Website, Company Description, Company City
- */
 function cleanEmailPhoneDuplicates(dataObject) {
   const { headers, columnMap, data } = dataObject;
-  
-  // V3: ONLY clean duplicates in Phone columns
-  // Emails are handled in Step 5 with proper business logic
-  // PRIORITY ORDER (keep first occurrence):
-  // Phones: Contact Mobile Phone > Contact Phone 1 > Company Phone 1 > Company Phone 2
+
   const columnsToClean = [
-    CONFIG.COLUMNS.CONTACT_MOBILE,    // Priority 1 for phones
-    CONFIG.COLUMNS.CONTACT_PHONE_1,   // Priority 2 for phones
-    CONFIG.COLUMNS.COMPANY_PHONE_1,   // Priority 3 for phones
-    CONFIG.COLUMNS.COMPANY_PHONE_2    // Priority 4 for phones
+    CONFIG.COLUMNS.CONTACT_MOBILE,
+    CONFIG.COLUMNS.CONTACT_PHONE_1,
+    CONFIG.COLUMNS.COMPANY_PHONE_1,
+    CONFIG.COLUMNS.COMPANY_PHONE_2
   ];
-  
+
   const cleanedData = data.map(row => {
-    const newRow = [...row];
-    const seenValues = new Set();
-    
-    // Get indices for columns to clean (only phones)
-    const indicesToClean = columnsToClean
+    const newRow     = [...row];
+    const seenDigits = new Set();
+
+    columnsToClean
       .map(col => columnMap[col])
-      .filter(idx => idx !== undefined);
-    
-    indicesToClean.forEach(colIdx => {
-      const value = row[colIdx];
-      
-      // Skip empty values
-      if (!value || value.toString().trim() === '') {
-        return;
-      }
-      
-      // Normalize for comparison: trim and lowercase
-      const normalizedValue = value.toString().trim().toLowerCase();
-      
-      if (seenValues.has(normalizedValue)) {
-        // Duplicate found within this row - clear it
-        newRow[colIdx] = '';
-      } else {
-        // First occurrence - keep it and add to set
-        seenValues.add(normalizedValue);
-        // Keep original value but trimmed
-        newRow[colIdx] = value.toString().trim();
-      }
-    });
-    
+      .filter(idx => idx !== undefined)
+      .forEach(colIdx => {
+        const value = row[colIdx];
+        if (!value || value.toString().trim() === '') return;
+        const digits = normalizePhoneDigits(value.toString());
+        if (!digits) return;
+        if (seenDigits.has(digits)) {
+          newRow[colIdx] = '';
+        } else {
+          seenDigits.add(digits);
+          newRow[colIdx] = value.toString().trim();
+        }
+      });
+
     return newRow;
   });
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: cleanedData
-  };
-}
 
-// =============================================================================
-// STEP 4: PRIMARY EMAIL FILL RULE
-// =============================================================================
-
-/**
- * Move Primary Email to Email 1 column (reverse of old logic)
- * Priority: Email 1 is the main email column
- * - If Email 1 is empty, move Primary Email → Email 1 and clear Primary
- * - If both have values, keep both (deduplication happens in Step 5)
- */
-function fillPrimaryEmail(dataObject) {
-  const { headers, columnMap, data } = dataObject;
-  
-  const primaryIdx = columnMap[CONFIG.COLUMNS.PRIMARY_EMAIL];
-  const email1Idx = columnMap[CONFIG.COLUMNS.EMAIL_1];
-  
-  // Skip if Primary Email column doesn't exist in source
-  if (primaryIdx === undefined) {
-    Logger.log('⊗ Skipping Primary Email move: Primary Email column not in source');
-    return dataObject;
-  }
-  
-  // Skip if Email 1 column doesn't exist
-  if (email1Idx === undefined) {
-    Logger.log('⊗ Skipping Primary Email move: Email 1 column not in source');
-    return dataObject;
-  }
-  
-  const filledData = data.map(row => {
-    const newRow = [...row];
-    
-    const primary = row[primaryIdx] ? row[primaryIdx].toString().trim() : '';
-    const email1 = row[email1Idx] ? row[email1Idx].toString().trim() : '';
-    
-    // If Email 1 is empty AND Primary Email has a value
-    // Move Primary Email → Email 1
-    if (!email1 && primary) {
-      newRow[email1Idx] = primary;  // Move to Email 1
-      newRow[primaryIdx] = '';       // Clear Primary
-    }
-    
-    return newRow;
-  });
-  
-  Logger.log('✓ Primary Email move to Email 1 complete');
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: filledData
-  };
+  Logger.log('✓ Phone column deduplication complete');
+  return { headers, columnMap, data: cleanedData };
 }
 
 // =============================================================================
 // STEP 5: EMAIL DEDUPLICATION
 // =============================================================================
 
-/**
- * Deduplicates emails according to business rules and normalizes them
- * Safely handles missing email columns
- */
 function deduplicateEmails(dataObject) {
   const { headers, columnMap, data } = dataObject;
-  
-  // Get column indices (may be undefined if column doesn't exist)
-  const primaryIdx = columnMap[CONFIG.COLUMNS.PRIMARY_EMAIL];
-  const email1Idx = columnMap[CONFIG.COLUMNS.EMAIL_1];
-  const email2Idx = columnMap[CONFIG.COLUMNS.EMAIL_2];
+
+  const email1Idx   = columnMap[CONFIG.COLUMNS.EMAIL_1];
+  const email2Idx   = columnMap[CONFIG.COLUMNS.EMAIL_2];
   const personalIdx = columnMap[CONFIG.COLUMNS.PERSONAL_EMAIL];
-  
-  // Check if we have any email columns to process
-  if (primaryIdx === undefined && email1Idx === undefined && 
-      email2Idx === undefined && personalIdx === undefined) {
-    Logger.log('⊗ Skipping email deduplication: No email columns found');
-    return dataObject;  // Return unchanged
+
+  if (email1Idx === undefined && email2Idx === undefined && personalIdx === undefined) {
+    Logger.log('⊗ Skipping email deduplication: no email columns found');
+    return dataObject;
   }
-  
+
   const cleanedData = data.map(row => {
-    const newRow = [...row];
-    
-    // Normalize and get emails (handle undefined indices)
-    let primary = primaryIdx !== undefined ? normalizeEmail(row[primaryIdx]) : '';
-    let email1 = email1Idx !== undefined ? normalizeEmail(row[email1Idx]) : '';
-    let email2 = email2Idx !== undefined ? normalizeEmail(row[email2Idx]) : '';
-    let personal = personalIdx !== undefined ? normalizeEmail(row[personalIdx]) : '';
-    
-    // Apply deduplication logic
-    const result = deduplicateEmailSet(primary, email1, email2);
-    
-    // Update row with deduplicated values (only if column exists)
-    if (primaryIdx !== undefined) newRow[primaryIdx] = result.primary;
-    if (email1Idx !== undefined) newRow[email1Idx] = result.email1;
-    if (email2Idx !== undefined) newRow[email2Idx] = result.email2;
-    if (personalIdx !== undefined) newRow[personalIdx] = personal; // Personal email stays separate
-    
+    const newRow   = [...row];
+    const email1   = email1Idx   !== undefined ? normalizeEmail(row[email1Idx])   : '';
+    const email2   = email2Idx   !== undefined ? normalizeEmail(row[email2Idx])   : '';
+    const personal = personalIdx !== undefined ? normalizeEmail(row[personalIdx]) : '';
+
+    let cleanEmail2   = email2;
+    let cleanPersonal = personal;
+    if (email1 && email1 === email2)    cleanEmail2   = '';
+    if (email1 && email1 === personal)  cleanPersonal = '';
+
+    if (email1Idx   !== undefined) newRow[email1Idx]   = email1;
+    if (email2Idx   !== undefined) newRow[email2Idx]   = cleanEmail2;
+    if (personalIdx !== undefined) newRow[personalIdx] = cleanPersonal;
+
     return newRow;
   });
-  
+
   Logger.log('✓ Email deduplication complete');
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: cleanedData
-  };
+  return { headers, columnMap, data: cleanedData };
 }
 
-/**
- * Normalizes an email: trim and lowercase
- */
 function normalizeEmail(email) {
-  if (!email || email.toString().trim() === '') {
-    return '';
-  }
+  if (!email || email.toString().trim() === '') return '';
   return email.toString().trim().toLowerCase();
-}
-
-/**
- * Implements email deduplication business logic
- * PRIORITY: Email 1 is the main email column
- * All duplicates are consolidated to Email 1
- * - If Primary = Email 1: Clear Primary, keep Email 1
- * - If Email 2 = Email 1: Clear Email 2, keep Email 1
- * - If all three same: Clear Primary and Email 2, keep Email 1
- * (Personal Email stays separate)
- */
-function deduplicateEmailSet(primary, email1, email2) {
-  // All empty - return empty
-  if (!primary && !email1 && !email2) {
-    return { primary: '', email1: '', email2: '' };
-  }
-  
-  // All three are the same - consolidate to Email 1
-  if (primary && primary === email1 && primary === email2) {
-    return { primary: '', email1: email1, email2: '' };
-  }
-  
-  // Primary = Email1 - consolidate to Email 1
-  if (primary && primary === email1) {
-    return { primary: '', email1: email1, email2: email2 };
-  }
-  
-  // Primary = Email2 - keep both (Primary in Primary, Email 2 in Email 2)
-  if (primary && primary === email2) {
-    return { primary: primary, email1: email1, email2: email2 };
-  }
-  
-  // Email1 = Email2 - consolidate to Email 1
-  if (email1 && email1 === email2) {
-    return { primary: primary, email1: email1, email2: '' };
-  }
-  
-  // All different - keep all
-  return { primary: primary, email1: email1, email2: email2 };
 }
 
 // =============================================================================
@@ -724,652 +601,484 @@ function deduplicateEmailSet(primary, email1, email2) {
 // =============================================================================
 
 /**
- * Deduplicates phones with Contact Mobile Phone priority
- * - Removes dots from phone numbers
- * - If duplicate exists, always keep Contact Mobile Phone
+ * Strips all non-digit characters and removes the leading US country code "1"
+ * so that 15551234567 and 5551234567 compare as equal.
  */
+function normalizePhoneDigits(phone) {
+  if (!phone) return '';
+  let digits = phone.toString().replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) digits = digits.substring(1);
+  return digits;
+}
+
+function normalizePhone(phone) {
+  if (!phone || phone.toString().trim() === '') return '';
+  return phone.toString().trim().replace(/\./g, '');
+}
+
 function deduplicatePhonesWithPriority(dataObject) {
   const { headers, columnMap, data } = dataObject;
-  
-  // Get column indices (may be undefined if column doesn't exist)
+
+  const contactMobileIdx = columnMap[CONFIG.COLUMNS.CONTACT_MOBILE];
   const contactPhone1Idx = columnMap[CONFIG.COLUMNS.CONTACT_PHONE_1];
   const companyPhone1Idx = columnMap[CONFIG.COLUMNS.COMPANY_PHONE_1];
   const companyPhone2Idx = columnMap[CONFIG.COLUMNS.COMPANY_PHONE_2];
-  const contactMobileIdx = columnMap[CONFIG.COLUMNS.CONTACT_MOBILE];
-  
-  // Check if we have any phone columns to process
-  if (contactPhone1Idx === undefined && companyPhone1Idx === undefined && 
-      companyPhone2Idx === undefined && contactMobileIdx === undefined) {
-    Logger.log('⊗ Skipping phone deduplication: No phone columns found');
-    return dataObject;  // Return unchanged
+
+  if (contactMobileIdx === undefined && contactPhone1Idx === undefined &&
+      companyPhone1Idx === undefined && companyPhone2Idx === undefined) {
+    Logger.log('⊗ Skipping phone deduplication: no phone columns found');
+    return dataObject;
   }
-  
+
   const cleanedData = data.map(row => {
     const newRow = [...row];
-    
-    // Get and normalize all phone numbers (remove dots) - handle undefined indices
-    let contactPhone1 = contactPhone1Idx !== undefined ? normalizePhone(row[contactPhone1Idx]) : '';
-    let companyPhone1 = companyPhone1Idx !== undefined ? normalizePhone(row[companyPhone1Idx]) : '';
-    let companyPhone2 = companyPhone2Idx !== undefined ? normalizePhone(row[companyPhone2Idx]) : '';
-    let contactMobile = contactMobileIdx !== undefined ? normalizePhone(row[contactMobileIdx]) : '';
-    
-    // Create map for comparison (digits only)
-    const phoneMap = new Map();
-    
-    // Priority order: Contact Mobile Phone is highest priority
-    let mobileDigits = '';
-    if (contactMobile) {
-      mobileDigits = extractDigitsOnly(contactMobile);
-      phoneMap.set(mobileDigits, 'mobile');
-    }
-    
-    // Now check other phones - if they match mobile, clear them
-    if (contactPhone1) {
-      const digits = extractDigitsOnly(contactPhone1);
-      if (digits === mobileDigits) {
-        contactPhone1 = ''; // Clear duplicate
-      } else if (!phoneMap.has(digits)) {
-        phoneMap.set(digits, 'contact1');
-      } else {
-        contactPhone1 = ''; // Clear duplicate
-      }
-    }
-    
-    if (companyPhone1) {
-      const digits = extractDigitsOnly(companyPhone1);
-      if (digits === mobileDigits) {
-        companyPhone1 = ''; // Clear duplicate
-      } else if (!phoneMap.has(digits)) {
-        phoneMap.set(digits, 'company1');
-      } else {
-        companyPhone1 = ''; // Clear duplicate
-      }
-    }
-    
-    if (companyPhone2) {
-      const digits = extractDigitsOnly(companyPhone2);
-      if (digits === mobileDigits) {
-        companyPhone2 = ''; // Clear duplicate
-      } else if (!phoneMap.has(digits)) {
-        phoneMap.set(digits, 'company2');
-      } else {
-        companyPhone2 = ''; // Clear duplicate
-      }
-    }
-    
-    // Update row with cleaned values (only if column exists)
-    if (contactPhone1Idx !== undefined) newRow[contactPhone1Idx] = contactPhone1;
-    if (companyPhone1Idx !== undefined) newRow[companyPhone1Idx] = companyPhone1;
-    if (companyPhone2Idx !== undefined) newRow[companyPhone2Idx] = companyPhone2;
-    if (contactMobileIdx !== undefined) newRow[contactMobileIdx] = contactMobile;
-    
+
+    let mobile   = contactMobileIdx !== undefined ? normalizePhone(row[contactMobileIdx]) : '';
+    let contact1 = contactPhone1Idx !== undefined ? normalizePhone(row[contactPhone1Idx]) : '';
+    let company1 = companyPhone1Idx !== undefined ? normalizePhone(row[companyPhone1Idx]) : '';
+    let company2 = companyPhone2Idx !== undefined ? normalizePhone(row[companyPhone2Idx]) : '';
+
+    const seenDigits   = new Set();
+    const mobileDigits = normalizePhoneDigits(mobile);
+    if (mobileDigits) seenDigits.add(mobileDigits);
+
+    const c1d = normalizePhoneDigits(contact1);
+    if (c1d)  { if (seenDigits.has(c1d))  contact1 = ''; else seenDigits.add(c1d); }
+    const cp1d = normalizePhoneDigits(company1);
+    if (cp1d) { if (seenDigits.has(cp1d)) company1 = ''; else seenDigits.add(cp1d); }
+    const cp2d = normalizePhoneDigits(company2);
+    if (cp2d) { if (seenDigits.has(cp2d)) company2 = ''; else seenDigits.add(cp2d); }
+
+    if (contactMobileIdx !== undefined) newRow[contactMobileIdx] = mobile;
+    if (contactPhone1Idx !== undefined) newRow[contactPhone1Idx] = contact1;
+    if (companyPhone1Idx !== undefined) newRow[companyPhone1Idx] = company1;
+    if (companyPhone2Idx !== undefined) newRow[companyPhone2Idx] = company2;
+
     return newRow;
   });
-  
+
   Logger.log('✓ Phone deduplication complete');
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: cleanedData
-  };
+  return { headers, columnMap, data: cleanedData };
 }
 
+
+// =============================================================================
+// STEP 6.5: NORMALIZE GENDER AND RACE/ETHNICITY
+// =============================================================================
+
 /**
- * Normalizes phone by removing dots
+ * Normalizes Gender and Race/Ethnicity values:
+ *
+ * Gender:
+ *   - Lowercases the value as-is  (Male → male, Female → female)
+ *
+ * Race/Ethnicity:
+ *   - "Asian/Pacific American" → "asian"  (special case — take first part)
+ *   - Everything else → lowercased as-is
  */
-function normalizePhone(phone) {
-  if (!phone || phone.toString().trim() === '') {
-    return '';
+function normalizeFieldValues(dataObject) {
+  const { headers, columnMap, data } = dataObject;
+
+  const genderIdx    = columnMap[CONFIG.COLUMNS.GENDER];
+  const ethnicityIdx = columnMap[CONFIG.COLUMNS.RACE_ETHNICITY];
+
+  if (genderIdx === undefined && ethnicityIdx === undefined) {
+    Logger.log('⊗ Skipping field normalization: no Gender or Race/Ethnicity columns found');
+    return dataObject;
   }
-  
-  const phoneStr = phone.toString().trim();
-  
-  // Remove dots from phone number
-  return phoneStr.replace(/\./g, '');
-}
 
-/**
- * Extracts only digits from phone for comparison
- */
-function extractDigitsOnly(phone) {
-  if (!phone) return '';
-  return phone.toString().replace(/\D/g, '');
+  const cleanedData = data.map(row => {
+    const newRow = [...row];
+
+    // Normalize Gender — lowercase only
+    if (genderIdx !== undefined) {
+      const val = (row[genderIdx] || '').toString().trim();
+      newRow[genderIdx] = val.toLowerCase();
+    }
+
+    // Normalize Race/Ethnicity
+    if (ethnicityIdx !== undefined) {
+      const val = (row[ethnicityIdx] || '').toString().trim();
+      if (!val) {
+        newRow[ethnicityIdx] = '';
+      } else if (val.toLowerCase().includes('asian/pacific')) {
+        // Special case: "Asian/Pacific American" → "asian"
+        newRow[ethnicityIdx] = 'asian';
+      } else {
+        // Everything else — just lowercase
+        newRow[ethnicityIdx] = val.toLowerCase();
+      }
+    }
+
+    return newRow;
+  });
+
+  Logger.log('✓ Gender and Race/Ethnicity normalization complete');
+  return { headers, columnMap, data: cleanedData };
 }
 
 // =============================================================================
 // STEP 7: NAME PARSING
 // =============================================================================
 
-/**
- * Handles name data intelligently based on what columns exist:
- * 
- * Scenario 1: First Name + Last Name columns exist
- *   → Use them directly (even if Contact Full Name also exists)
- * 
- * Scenario 2: Only Contact Full Name exists (no First/Last columns)
- *   → Parse Contact Full Name into First + Last
- * 
- * Scenario 3: None exist
- *   → Empty names
- * 
- * OUTPUT: Always includes First Name and Last Name in output
- *         (either from source columns or parsed from Contact Full Name)
- */
 function parseNames(dataObject) {
   const { headers, columnMap, data } = dataObject;
-  
-  const fullNameIdx = columnMap[CONFIG.COLUMNS.FULL_NAME];
+
+  const fullNameIdx  = columnMap[CONFIG.COLUMNS.FULL_NAME];
   const firstNameIdx = columnMap[CONFIG.COLUMNS.FIRST_NAME];
-  const lastNameIdx = columnMap[CONFIG.COLUMNS.LAST_NAME];
-  
-  // Determine strategy
-  const hasFirstOrLastColumn = firstNameIdx !== undefined || lastNameIdx !== undefined;
-  
-  // Debug logging
-  Logger.log('parseNames - Strategy:');
-  Logger.log(`  Contact Full Name index: ${fullNameIdx}`);
-  Logger.log(`  First Name index: ${firstNameIdx}`);
-  Logger.log(`  Last Name index: ${lastNameIdx}`);
-  
-  if (hasFirstOrLastColumn) {
-    Logger.log('  → Strategy: Using existing First/Last Name columns');
-  } else if (fullNameIdx !== undefined) {
-    Logger.log('  → Strategy: Parsing Contact Full Name');
-  } else {
-    Logger.log('  → Strategy: No name columns found - using empty names');
-  }
-  
-  const parsedData = data.map((row, idx) => {
+  const lastNameIdx  = columnMap[CONFIG.COLUMNS.LAST_NAME];
+
+  const hasFirstOrLast = firstNameIdx !== undefined || lastNameIdx !== undefined;
+
+  Logger.log(`parseNames — fullNameIdx: ${fullNameIdx}, firstNameIdx: ${firstNameIdx}, lastNameIdx: ${lastNameIdx}`);
+
+  const parsedData = data.map(row => {
     let firstName = '';
-    let lastName = '';
-    
-    // PRIORITY 1: Use existing First Name and Last Name columns if they exist
-    // (This takes priority even if Contact Full Name also exists)
-    if (hasFirstOrLastColumn) {
-      firstName = firstNameIdx !== undefined && row[firstNameIdx] 
-        ? row[firstNameIdx].toString().trim() 
-        : '';
-      lastName = lastNameIdx !== undefined && row[lastNameIdx] 
-        ? row[lastNameIdx].toString().trim() 
-        : '';
-      
-      // Debug first row
-      if (idx === 0) {
-        Logger.log(`  Row 1 - Using source columns:`);
-        Logger.log(`    First Name: "${firstName}"`);
-        Logger.log(`    Last Name: "${lastName}"`);
-      }
-    } 
-    // PRIORITY 2: Parse from Contact Full Name if no First/Last columns exist
-    else if (fullNameIdx !== undefined && row[fullNameIdx]) {
-      const fullName = row[fullNameIdx].toString().trim();
-      const parsed = parseFullName(fullName);
+    let lastName  = '';
+
+    if (hasFirstOrLast) {
+      // Priority 1: Use First Name / Last Name columns directly
+      firstName = firstNameIdx !== undefined && row[firstNameIdx]
+        ? row[firstNameIdx].toString().trim() : '';
+      lastName  = lastNameIdx  !== undefined && row[lastNameIdx]
+        ? row[lastNameIdx].toString().trim()  : '';
+    } else if (fullNameIdx !== undefined && row[fullNameIdx]) {
+      // Priority 2: Parse Contact Full Name into first + last
+      const parsed = parseFullName(row[fullNameIdx].toString().trim());
       firstName = parsed.firstName;
-      lastName = parsed.lastName;
-      
-      // Debug first row
-      if (idx === 0) {
-        Logger.log(`  Row 1 - Parsed from Contact Full Name: "${fullName}"`);
-        Logger.log(`    → First: "${firstName}"`);
-        Logger.log(`    → Last: "${lastName}"`);
-      }
+      lastName  = parsed.lastName;
     }
-    // PRIORITY 3: No name columns at all - use empty
-    else {
-      if (idx === 0) {
-        Logger.log(`  Row 1 - No name data available (empty)`);
-      }
-    }
-    
-    return {
-      originalRow: row,
-      firstName: firstName,
-      lastName: lastName
-    };
+
+    return { originalRow: row, firstName, lastName };
   });
-  
-  return {
-    headers: headers,
-    columnMap: columnMap,
-    data: parsedData
-  };
+
+  Logger.log('✓ Name parsing complete');
+  return { headers, columnMap, data: parsedData };
 }
 
-/**
- * Intelligently parses a full name into first and last name
- */
 function parseFullName(fullName) {
-  if (!fullName || fullName.trim() === '') {
-    return { firstName: '', lastName: '' };
-  }
-  
+  if (!fullName || fullName.trim() === '') return { firstName: '', lastName: '' };
   const parts = fullName.trim().split(/\s+/).filter(p => p.length > 0);
-  
-  if (parts.length === 0) {
-    return { firstName: '', lastName: '' };
-  }
-  
-  if (parts.length === 1) {
-    return { firstName: parts[0], lastName: '' };
-  }
-  
-  // For 2+ words: split in the middle
-  const midPoint = Math.ceil(parts.length / 2);
-  const firstName = parts.slice(0, midPoint).join(' ');
-  const lastName = parts.slice(midPoint).join(' ');
-  
-  return { firstName, lastName };
+  if (parts.length === 0) return { firstName: '', lastName: '' };
+  if (parts.length === 1) return { firstName: parts[0], lastName: '' };
+  // First word = first name, rest = last name
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
 }
 
 // =============================================================================
 // STEP 8: OUTPUT SHEET CREATION
 // =============================================================================
 
-/**
- * Creates or clears the output sheet
- */
 function createOutputSheet(spreadsheet, sourceSheet) {
   let outputSheet = spreadsheet.getSheetByName(CONFIG.OUTPUT_SHEET_NAME);
-  
   if (outputSheet) {
     outputSheet.clear();
   } else {
     outputSheet = spreadsheet.insertSheet(CONFIG.OUTPUT_SHEET_NAME);
   }
-  
   return outputSheet;
 }
 
-/**
- * Writes cleaned data with specified column order
- * Note: Reads "Company Name - Cleaned" from source, outputs as "Organization"
- */
+// =============================================================================
+// STEP 9: WRITE OUTPUT DATA
+// =============================================================================
+
 function writeOutputData(outputSheet, dataObject, sourceSheetName) {
-  const { headers, columnMap, data } = dataObject;
-  
-  // Get validation results to know which optional columns were found
-  const validation = CONFIG._VALIDATION_RESULTS || {};
+  const { columnMap, data } = dataObject;
+
+  const validation    = CONFIG._VALIDATION_RESULTS || {};
   const foundOptional = validation.foundOptional || [];
-  
-  // Define ALL possible output columns
+
+  // All possible output columns in desired order
+  // Contact Full Name → First Name + Last Name split in output
   const allPossibleColumns = [
-    'Contact Full Name',      // Optional (if exists in source)
-    'First Name',             // Optional (only if Contact Full Name exists)
-    'Last Name',              // Optional (only if Contact Full Name exists)
-    'Organization',           // Always included (critical)
-    'Primary Email',          // Optional
-    'Email 1',                // Optional
-    'Email 2',                // Optional
-    'Personal Email',         // Optional
-    'Contact Phone 1',        // Optional
-    'Company Phone 1',        // Optional
-    'Company Phone 2',        // Optional
-    'Contact Mobile Phone',   // Optional
-    'Company Description',    // Optional
-    'Website',                // Optional
-    'Company City'            // Optional
+    'Contact Full Name',
+    'First Name',
+    'Last Name',
+    'Organization',
+    'Email 1',
+    'Email 2',
+    'Personal Email',
+    'Contact Mobile Phone',
+    'Contact Phone 1',
+    'Company Phone 1',
+    'Company Phone 2',
+    'Address 1',
+    'Address 2',
+    'Company City',
+    'Company State',
+    'County',
+    'Zip',
+    'Gender',
+    'Race/Ethnicity',
+    'Industry',
+    'Website',
+    'Company Description'
   ];
-  
-  // Check which name columns exist in source
+
+  const hasAnyNameData = foundOptional.includes('Contact Full Name') ||
+                         foundOptional.includes('First Name') ||
+                         foundOptional.includes('Last Name');
+
+  // Only include columns that exist in the source sheet
   const hasContactFullName = foundOptional.includes('Contact Full Name');
-  const hasFirstName = foundOptional.includes('First Name');
-  const hasLastName = foundOptional.includes('Last Name');
-  
-  // We'll have First/Last Name in output if ANY name data exists
-  const hasAnyNameData = hasContactFullName || hasFirstName || hasLastName;
-  
-  // Build output headers - only include optional columns that were found
+
   const outputHeaders = allPossibleColumns.filter(header => {
-    // Always include Organization
-    if (header === 'Organization') {
-      return true;
-    }
-    // ALWAYS include First Name and Last Name in output if we have ANY name data
-    // (They'll either come from source columns or be parsed from Contact Full Name)
-    if (header === 'First Name' || header === 'Last Name') {
-      return hasAnyNameData;
-    }
-    // Contact Full Name: Only include if it exists in source
-    if (header === 'Contact Full Name') {
-      return hasContactFullName;
-    }
-    // Include other optional columns only if they were found in source
+    if (header === 'Organization')     return true;      // always required
+    if (header === 'Contact Full Name') return hasContactFullName;
+    // First Name and Last Name: always include when ANY name data exists
+    // (they come from parseNames() even if not separate columns in source)
+    if (header === 'First Name' || header === 'Last Name') return hasAnyNameData;
     return foundOptional.includes(header);
   });
-  
-  // Write headers
+
+  // Header mapping: output column name → CONFIG column key name
+  const headerToSourceCol = {
+    'Contact Full Name':     CONFIG.COLUMNS.FULL_NAME,
+    'Organization':         CONFIG.COLUMNS.ORGANIZATION,
+    'Email 1':              CONFIG.COLUMNS.EMAIL_1,
+    'Email 2':              CONFIG.COLUMNS.EMAIL_2,
+    'Personal Email':       CONFIG.COLUMNS.PERSONAL_EMAIL,
+    'Contact Mobile Phone': CONFIG.COLUMNS.CONTACT_MOBILE,
+    'Contact Phone 1':      CONFIG.COLUMNS.CONTACT_PHONE_1,
+    'Company Phone 1':      CONFIG.COLUMNS.COMPANY_PHONE_1,
+    'Company Phone 2':      CONFIG.COLUMNS.COMPANY_PHONE_2,
+    'Address 1':            CONFIG.COLUMNS.ADDRESS_1,
+    'Address 2':            CONFIG.COLUMNS.ADDRESS_2,
+    'Company City':         CONFIG.COLUMNS.COMPANY_CITY,
+    'Company State':        CONFIG.COLUMNS.COMPANY_STATE,
+    'County':               CONFIG.COLUMNS.COUNTY,
+    'Zip':                  CONFIG.COLUMNS.ZIP,
+    'Gender':               CONFIG.COLUMNS.GENDER,
+    'Race/Ethnicity':       CONFIG.COLUMNS.RACE_ETHNICITY,
+    'Industry':             CONFIG.COLUMNS.INDUSTRY,
+    'Website':              CONFIG.COLUMNS.WEBSITE,
+    'Company Description':  CONFIG.COLUMNS.COMPANY_DESC
+  };
+
+  // Write header row
   outputSheet.getRange(1, 1, 1, outputHeaders.length)
     .setValues([outputHeaders])
     .setFontWeight('bold')
     .setBackground('#4285f4')
     .setFontColor('#ffffff');
-  
-  // Map of output header to source column
-  const headerMapping = {
-    'Contact Full Name': CONFIG.COLUMNS.FULL_NAME,
-    'Organization': CONFIG.COLUMNS.ORGANIZATION,
-    'Primary Email': CONFIG.COLUMNS.PRIMARY_EMAIL,
-    'Email 1': CONFIG.COLUMNS.EMAIL_1,
-    'Email 2': CONFIG.COLUMNS.EMAIL_2,
-    'Personal Email': CONFIG.COLUMNS.PERSONAL_EMAIL,
-    'Contact Phone 1': CONFIG.COLUMNS.CONTACT_PHONE_1,
-    'Company Phone 1': CONFIG.COLUMNS.COMPANY_PHONE_1,
-    'Company Phone 2': CONFIG.COLUMNS.COMPANY_PHONE_2,
-    'Contact Mobile Phone': CONFIG.COLUMNS.CONTACT_MOBILE,
-    'Company Description': CONFIG.COLUMNS.COMPANY_DESC,
-    'Website': CONFIG.COLUMNS.WEBSITE,
-    'Company City': CONFIG.COLUMNS.COMPANY_CITY
-  };
-  
-  // Prepare output data
+
+  // Build data rows
   const outputData = data.map(item => {
     const row = item.originalRow;
-    const outputRow = [];
-    
-    // Add columns in exact order
-    outputHeaders.forEach(header => {
-      if (header === 'First Name') {
-        outputRow.push(item.firstName);
-      } else if (header === 'Last Name') {
-        outputRow.push(item.lastName);
-      } else {
-        const sourceColumn = headerMapping[header];
-        const colIdx = columnMap[sourceColumn];
-        outputRow.push(colIdx !== undefined ? row[colIdx] : '');
-      }
+    return outputHeaders.map(header => {
+      if (header === 'First Name') return item.firstName;
+      if (header === 'Last Name')  return item.lastName;
+      const sourceColName = headerToSourceCol[header];
+      const colIdx        = sourceColName ? columnMap[sourceColName] : undefined;
+      return colIdx !== undefined ? row[colIdx] : '';
     });
-    
-    return outputRow;
   });
-  
-  // Write data in batches
+
+  // Write in batches
   if (outputData.length > 0) {
-    const batchSize = CONFIG.BATCH_SIZE;
-    for (let i = 0; i < outputData.length; i += batchSize) {
-      const batch = outputData.slice(i, i + batchSize);
-      const startRow = i + 2;
-      outputSheet.getRange(startRow, 1, batch.length, outputHeaders.length)
-        .setValues(batch);
+    for (let i = 0; i < outputData.length; i += CONFIG.BATCH_SIZE) {
+      const batch = outputData.slice(i, i + CONFIG.BATCH_SIZE);
+      outputSheet.getRange(i + 2, 1, batch.length, outputHeaders.length).setValues(batch);
     }
   }
-  
-  // Format sheet
+
   outputSheet.setFrozenRows(1);
-  // Auto-resize columns - REMOVED (too slow on large datasets)
-  // outputSheet.autoResizeColumns(1, outputHeaders.length);
-  
-  Logger.log(`✓ Data written successfully: ${outputData.length} rows`);
+  Logger.log(`✓ Written ${outputData.length} rows with ${outputHeaders.length} columns`);
 }
 
 // =============================================================================
 // STEP 10: DUPLICATES REPORT
 // =============================================================================
 
-/**
- * Creates a "Duplicates Report" sheet showing all removed duplicates
- * with their original row numbers and what they duplicated
- */
 function createDuplicatesReport(spreadsheet, duplicates) {
   const REPORT_SHEET_NAME = 'Duplicates Report';
-  
-  // Create or clear report sheet
+
   let reportSheet = spreadsheet.getSheetByName(REPORT_SHEET_NAME);
   if (reportSheet) {
     reportSheet.clear();
   } else {
     reportSheet = spreadsheet.insertSheet(REPORT_SHEET_NAME);
   }
-  
-  // Define headers
+
   const headers = [
     'Duplicate Row #',
     'Original Row #',
     'Contact Full Name',
     'Company Name',
-    'Website',
-    'Company Description',
+    'Email 1',
     'Match Criteria',
     'Status'
   ];
-  
-  // Write headers
+
   reportSheet.getRange(1, 1, 1, headers.length)
     .setValues([headers])
     .setFontWeight('bold')
-    .setBackground('#ea4335')  // Red background for duplicates
+    .setBackground('#ea4335')
     .setFontColor('#ffffff');
-  
-  // If no duplicates found
+
   if (!duplicates || duplicates.length === 0) {
     reportSheet.getRange(2, 1, 1, headers.length)
-      .setValues([['No duplicates found', '', '', '', '', '', '', '✅ All unique!']])
-      .setBackground('#d9ead3')  // Light green
+      .setValues([['No duplicates found', '', '', '', '', '', '✅ All unique!']])
+      .setBackground('#d9ead3')
       .setFontStyle('italic');
-    
-    Logger.log('✓ Duplicates report created: No duplicates found');
+    Logger.log('✓ Duplicates report: no duplicates found');
     return reportSheet;
   }
-  
-  // Prepare duplicate data
+
   const reportData = duplicates.map(dup => [
     dup.duplicateRowNumber,
     dup.originalRowNumber,
-    dup.fullName || '',
+    dup.fullName    || '',
     dup.companyName || '',
-    dup.website || '',
-    dup.description || '',
+    dup.email1      || '',
     dup.matchCriteria,
     '🗑️ Removed'
   ]);
-  
-  // Write data in batches
-  if (reportData.length > 0) {
-    const batchSize = 1000;
-    for (let i = 0; i < reportData.length; i += batchSize) {
-      const batch = reportData.slice(i, i + batchSize);
-      const startRow = i + 2;
-      reportSheet.getRange(startRow, 1, batch.length, headers.length)
-        .setValues(batch);
-    }
+
+  for (let i = 0; i < reportData.length; i += 1000) {
+    const batch = reportData.slice(i, i + 1000);
+    reportSheet.getRange(i + 2, 1, batch.length, headers.length).setValues(batch);
   }
-  
-  // Format sheet
+
   reportSheet.setFrozenRows(1);
-  
-  // Alternate row colors for readability
-  if (reportData.length > 0) {
-    for (let i = 0; i < reportData.length; i++) {
-      const rowNum = i + 2;
-      const bgColor = i % 2 === 0 ? '#ffffff' : '#f3f3f3';
-      reportSheet.getRange(rowNum, 1, 1, headers.length)
-        .setBackground(bgColor);
-    }
+
+  // Alternate row shading
+  for (let i = 0; i < reportData.length; i++) {
+    reportSheet.getRange(i + 2, 1, 1, headers.length)
+      .setBackground(i % 2 === 0 ? '#ffffff' : '#f3f3f3');
   }
-  
-  // Add summary at the bottom
+
+  // Summary row
   const summaryRow = reportData.length + 3;
   reportSheet.getRange(summaryRow, 1, 1, 2)
     .setValues([[`Total Duplicates Found:`, duplicates.length]])
     .setFontWeight('bold')
-    .setBackground('#fff2cc');  // Light yellow
-  
-  Logger.log(`✓ Duplicates report created: ${duplicates.length} duplicates tracked`);
-  
+    .setBackground('#fff2cc');
+
+  Logger.log(`✓ Duplicates report: ${duplicates.length} duplicates`);
   return reportSheet;
-}
-
-// =============================================================================
-// STEP 11: VALIDATION FORMULA
-// =============================================================================
-
-/**
- * DISABLED: Adds validation formula to check data integrity
- * This function causes timeout on large datasets and has been disabled
- * @deprecated No longer used in pipeline
- */
-function addValidationFormula(outputSheet, sourceSheetName) {
-  const lastRow = outputSheet.getLastRow();
-  
-  if (lastRow < 2) {
-    return;
-  }
-  
-  const validationCol = 16;
-  
-  const formulaTemplate = `=IFERROR(
- IF(
-  AND(
-   A{ROW} = INDEX('${sourceSheetName}'!A:A, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),
-   D{ROW} = INDEX('${sourceSheetName}'!B:B, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),
-   N{ROW} = INDEX('${sourceSheetName}'!C:C, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),
-   F{ROW} = INDEX('${sourceSheetName}'!E:E, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),
-   TRIM(SUBSTITUTE(M{ROW},CHAR(10)," ")) =
-     TRIM(SUBSTITUTE(INDEX('${sourceSheetName}'!M:M, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),CHAR(10)," ")),
-   O{ROW} = INDEX('${sourceSheetName}'!L:L, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0)),
-   L{ROW} = INDEX('${sourceSheetName}'!K:K, MATCH(E{ROW}, '${sourceSheetName}'!D:D, 0))
-  ),
-  "MATCH OK",
-  "DATA MISMATCH"
- ),
- "NOT FOUND"
-)`;
-  
-  // Apply formula to each row
-  for (let row = 2; row <= lastRow; row++) {
-    const formula = formulaTemplate.replace(/{ROW}/g, row);
-    outputSheet.getRange(row, validationCol).setFormula(formula);
-  }
-  
-  // Format validation column
-  const validationRange = outputSheet.getRange(2, validationCol, lastRow - 1, 1);
-  
-  const matchRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenTextEqualTo('MATCH OK')
-    .setBackground('#d9ead3')
-    .setFontColor('#38761d')
-    .setRanges([validationRange])
-    .build();
-  
-  const mismatchRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenTextEqualTo('DATA MISMATCH')
-    .setBackground('#f4cccc')
-    .setFontColor('#cc0000')
-    .setRanges([validationRange])
-    .build();
-  
-  const notFoundRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenTextEqualTo('NOT FOUND')
-    .setBackground('#fff2cc')
-    .setFontColor('#bf9000')
-    .setRanges([validationRange])
-    .build();
-  
-  const rules = outputSheet.getConditionalFormatRules();
-  rules.push(matchRule, mismatchRule, notFoundRule);
-  outputSheet.setConditionalFormatRules(rules);
 }
 
 // =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
 
-/**
- * Creates ONE unified menu in the Google Sheets UI
- * Works on any Google Sheet when this Apps Script project is attached
- * 
- * MENU STRUCTURE:
- * 🔧 Data Tools
- * ├── 📊 Data Cleanup
- * │   └── Run Pipeline V3
- * ├── 🏠 Categorize Companies
- * │   ├── Categorize All Companies
- * │   └── Upload Checked Entries
- * ├── 📧 Email Validation
- * │   ├── Validate Primary Email
- * │   ├── Validate Email 1
- * │   ├── Validate Email 2
- * │   └── Validate Personal Email
- * ├── 📞 Phone Validation
- * │   ├── Validate Contact Phone 1
- * │   ├── Validate Company Phone 1
- * │   ├── Validate Company Phone 2
- * │   └── Validate Contact Mobile Phone
- * └── 🎯 CRM Ready
- *     ├── Create CRM Ready Sheet
- *     ├── Compare with CRM Ready
- *     ├── Comparison Info
- *     └── View Settings
- */
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  
-  // Create main menu with submenus
-  ui.createMenu('🔧 Data Tools')
-    
-    // Pipeline Dashboard - at top level for easy access
-    .addItem('📊 View Pipeline Dashboard', 'createPipelineDashboard')
-    .addSeparator()
-    
-    // Data Cleanup submenu
-    .addSubMenu(ui.createMenu('🧹 Data Cleanup')
-      .addItem('▶️ Run Pipeline V3', 'runDataCleaningPipelineV3')
-      .addSeparator()
-      .addItem('📋 View Logs', 'showLogs'))
-    
-    // Categorize Companies submenu
-    .addSubMenu(ui.createMenu('🏠 Categorize Companies')
-      .addItem('▶️ Categorize All Companies', 'categorizeAllCompanies')
-      .addSeparator()
-      .addItem('📤 Upload Checked Entries', 'uploadCheckedEntriesCat'))
-    
-    // Email Validation submenu
-    .addSubMenu(ui.createMenu('📧 Email Validation')
-      .addItem('📬 Validate Primary Email', 'validatePrimaryEmail')
-      .addItem('📧 Validate Email 1', 'validateEmail1')
-      .addItem('📧 Validate Email 2', 'validateEmail2')
-      .addItem('📨 Validate Personal Email', 'validatePersonalEmail')
-      .addSeparator()
-      .addItem('⚙️ Configure Settings', 'showEmailConfigDialog')
-      .addItem('📋 View Validation Logs', 'showEmailValidationLogs'))
-    
-    // Phone Validation submenu
-    .addSubMenu(ui.createMenu('📞 Phone Validation')
-      .addItem('📱 Validate Contact Phone 1', 'validateContactPhone1')
-      .addItem('🏢 Validate Company Phone 1', 'validateCompanyPhone1')
-      .addItem('🏢 Validate Company Phone 2', 'validateCompanyPhone2')
-      .addItem('📱 Validate Contact Mobile Phone', 'validateContactMobilePhone')
-      .addSeparator()
-      .addItem('⚙️ Configure Settings', 'showConfigDialog')
-      .addItem('📋 View Validation Logs', 'showValidationLogs'))
-    
-    // CRM Ready submenu
-    .addSubMenu(ui.createMenu('🎯 CRM Ready')
-      .addItem('▶️ Create CRM Ready Sheet', 'createCRMReady')
-      .addItem('📞 Generate CRM Callers Ready', 'generateCRMCallersReady')
-      .addSeparator()
-      .addItem('📊 Compare with CRM Ready', 'compareWithCRMReady')
-      .addItem('ℹ️ Comparison Info', 'showComparisonInfo')
-      .addSeparator()
-      .addItem('⚙️ View Settings', 'showCRMConfig'))
-    
-    .addToUi();
-}
-
-/**
- * Shows execution logs
- */
 function showLogs() {
   const logs = Logger.getLog();
-  const ui = SpreadsheetApp.getUi();
-  
-  ui.alert(
+  SpreadsheetApp.getUi().alert(
     'Execution Logs',
     logs || 'No logs available',
-    ui.ButtonSet.OK
+    SpreadsheetApp.getUi().ButtonSet.OK
   );
 }
 
 // =============================================================================
-// END OF SCRIPT V3
+// MENU
+// =============================================================================
+
+/**
+ * Creates ONE unified menu in the Google Sheets UI
+ *
+ * MENU STRUCTURE:
+ * 🔧 Data Tools
+ * ├── 📊 View Pipeline Dashboard
+ * ├── 🧹 Data Cleanup
+ * │   ├── ▶️ Run Pipeline V5
+ * │   ├── 🚫 Exclude Companies
+ * │   ├── 📊 Audit Report
+ * │   └── 📋 View Logs
+ * ├── 🏠 Categorize Companies
+ * │   ├── Categorize All Companies
+ * │   └── Upload Checked Entries
+ * ├── 📧 Email Validation
+ * │   ├── Validate Email 1
+ * │   ├── Validate Email 2
+ * │   ├── Validate Personal Email
+ * │   ├── ─────────────────────────
+ * │   ├── 🛑 Cancel Running Validation
+ * │   ├── ─────────────────────────
+ * │   ├── ⚙️ Configure Settings
+ * │   └── 📋 View Validation Logs
+ * ├── 📞 Phone Validation
+ * │   ├── ▶️ Validate All (Email + Phones)
+ * │   ├── ─────────────────────────
+ * │   ├── Validate Contact Mobile Phone
+ * │   ├── Validate Contact Phone 1
+ * │   ├── Validate Company Phone 1
+ * │   ├── Validate Company Phone 2
+ * │   ├── ─────────────────────────
+ * │   ├── 🛑 Cancel Running Validation
+ * │   ├── ─────────────────────────
+ * │   ├── ⚙️ Configure Settings
+ * │   └── 📋 View Validation Logs
+ * └── 🎯 CRM Ready
+ *     ├── 📞 Generate CRM Callers Ready
+ *     ├── ─────────────────────────
+ *     ├── 📊 Compare with CRM Ready
+ *     ├── ℹ️ Comparison Info
+ *     ├── ─────────────────────────
+ *     └── ⚙️ View Settings
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu('🔧 Data Tools')
+
+    .addItem('📊 View Pipeline Dashboard', 'createPipelineDashboard')
+    .addSeparator()
+
+    // Data Cleanup
+    .addSubMenu(ui.createMenu('🧹 Data Cleanup')
+      .addItem('▶️ Run Pipeline V5',    'runDataCleaningPipelineV3')
+      .addItem('🚫 Exclude Companies',  'excludeCompanies')
+      .addItem('📊 Audit Report',       'generateAuditReport')
+      .addSeparator()
+      .addItem('📋 View Logs',          'showLogs'))
+
+    // Categorize Companies
+    .addSubMenu(ui.createMenu('🏠 Categorize Companies')
+      .addItem('▶️ Categorize All Companies', 'categorizeAllCompanies')
+      .addSeparator()
+      .addItem('📤 Upload Checked Entries', 'uploadCheckedEntriesCat'))
+
+    // Email Validation
+    .addSubMenu(ui.createMenu('📧 Email Validation')
+      .addItem('📧 Validate Email 1',         'validateEmail1')
+      .addItem('📧 Validate Email 2',          'validateEmail2')
+      .addItem('📨 Validate Personal Email',   'validatePersonalEmail')
+      .addSeparator()
+      .addItem('🛑 Cancel Running Validation', 'cancelEmailValidation')
+      .addSeparator()
+      .addItem('⚙️ Configure Settings',        'showEmailConfigDialog')
+      .addItem('📋 View Validation Logs',       'showEmailValidationLogs'))
+
+    // Phone Validation
+    .addSubMenu(ui.createMenu('📞 Phone Validation')
+      .addItem('▶️ Validate All (Email + Phones)', 'validateAll')
+      .addSeparator()
+      .addItem('📱 Validate Contact Mobile Phone',  'validateContactMobilePhone')
+      .addItem('📱 Validate Contact Phone 1',       'validateContactPhone1')
+      .addItem('🏢 Validate Company Phone 1',       'validateCompanyPhone1')
+      .addItem('🏢 Validate Company Phone 2',       'validateCompanyPhone2')
+      .addSeparator()
+      .addItem('🛑 Cancel Running Validation',      'cancelPhoneValidation')
+      .addSeparator()
+      .addItem('⚙️ Configure Settings',             'showConfigDialog')
+      .addItem('📋 View Validation Logs',            'showValidationLogs'))
+
+    // CRM Ready
+    .addSubMenu(ui.createMenu('🎯 CRM Ready')
+      .addItem('📞 Generate CRM Callers Ready',  'generateCRMCallersReady')
+      .addSeparator()
+      .addItem('📊 Compare with CRM Ready',      'compareWithCRMReady')
+      .addItem('ℹ️ Comparison Info',             'showComparisonInfo')
+      .addSeparator()
+      .addItem('⚙️ View Settings',               'showCRMConfig'))
+
+    .addToUi();
+}
+
+// =============================================================================
+// END OF SCRIPT V5
 // =============================================================================
