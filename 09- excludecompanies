@@ -1,0 +1,330 @@
+/**
+ * =============================================================================
+ * EXCLUDE COMPANIES - V1.0
+ * =============================================================================
+ *
+ * Removes rows from the "Validation" sheet where the Company Name matches
+ * any company listed in the "Exclude" tab.
+ *
+ * HOW IT WORKS:
+ * 1. Reads all company names from the "Exclude" tab (column: "Company Name")
+ * 2. Scans every row in the "Validation" tab
+ * 3. If a row's Company Name matches any excluded company (case-insensitive,
+ *    exact match), it is moved to the "Excluded Companies" tab
+ * 4. Shows a summary when done
+ *
+ * SHEETS:
+ * - "Exclude"            → list of company names to remove (source list)
+ * - "Validation"         → sheet to clean (rows are removed from here)
+ * - "Excluded Companies" → report of all removed rows (created/overwritten)
+ *
+ * MATCHING:
+ * - Exact match, case-insensitive
+ * - Trims whitespace before comparing
+ *
+ * MENU: 🔧 Data Tools → 🧹 Data Cleanup → 🚫 Exclude Companies
+ *
+ * @author: Claude
+ * @version: 1.0
+ */
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const EXCLUDE_CONFIG = {
+  EXCLUDE_SHEET:   'Exclude',            // Tab with the list of companies to remove
+  VALIDATION_SHEET: 'Validation',        // Tab to clean
+  REPORT_SHEET:    'Excluded Companies', // Tab where removed rows are moved to
+  COMPANY_COLUMN:  'Company Name',       // Column name in both sheets
+
+  // Header colors
+  REPORT_HEADER_BG: '#ea4335',           // Red — matches Excluded Contacts style
+  REASON_BG:        '#fce8e6'            // Light red — reason column cells
+};
+
+// =============================================================================
+// MAIN FUNCTION
+// =============================================================================
+
+/**
+ * Entry point — called from the menu.
+ * Reads the Exclude tab, scans the Validation tab, moves matching rows
+ * to the Excluded Companies tab.
+ */
+function excludeCompanies() {
+  try {
+    const startTime = new Date();
+    Logger.log('=== Starting Company Exclusion ===');
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // ── Get the Exclude tab ───────────────────────────────────────────────────
+    const excludeSheet = ss.getSheetByName(EXCLUDE_CONFIG.EXCLUDE_SHEET);
+    if (!excludeSheet) {
+      SpreadsheetApp.getUi().alert(
+        '⚠️ Exclude Tab Not Found',
+        `Could not find a tab called "${EXCLUDE_CONFIG.EXCLUDE_SHEET}".\n\n` +
+        'Please create a tab with that exact name and add the company names\n' +
+        'you want to exclude, one per row, under a "Company Name" column header.',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    // ── Get the Validation tab ────────────────────────────────────────────────
+    const validationSheet = ss.getSheetByName(EXCLUDE_CONFIG.VALIDATION_SHEET);
+    if (!validationSheet) {
+      SpreadsheetApp.getUi().alert(
+        '⚠️ Validation Tab Not Found',
+        `Could not find a tab called "${EXCLUDE_CONFIG.VALIDATION_SHEET}".\n\n` +
+        'Please make sure the sheet you want to clean is named exactly "Validation".',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    // ── Read exclusion list ───────────────────────────────────────────────────
+    const excludeSet = readExcludeList(excludeSheet);
+
+    if (excludeSet.size === 0) {
+      SpreadsheetApp.getUi().alert(
+        '⚠️ Exclude List Is Empty',
+        `The "${EXCLUDE_CONFIG.EXCLUDE_SHEET}" tab has no company names.\n\n` +
+        `Please add company names under a "${EXCLUDE_CONFIG.COMPANY_COLUMN}" column header.`,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    Logger.log(`Exclusion list: ${excludeSet.size} companies`);
+
+    // ── Scan Validation tab and split rows ────────────────────────────────────
+    const result = scanAndSplitRows(validationSheet, excludeSet);
+
+    if (result.removedRows.length === 0) {
+      SpreadsheetApp.getUi().alert(
+        'ℹ️ No Matches Found',
+        `None of the ${excludeSet.size} companies in the Exclude list\n` +
+        `were found in the "${EXCLUDE_CONFIG.VALIDATION_SHEET}" tab.\n\n` +
+        'No rows were removed.',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    // ── Remove matched rows from Validation tab FIRST ───────────────────────────
+    // Done before writing the report so that sheet insertions/deletions in
+    // writeExcludedCompaniesReport() cannot interfere with the row deletion.
+    removeRowsFromSheet(validationSheet, result.rowIndicesToRemove);
+
+    // ── Write removed rows to Excluded Companies report ───────────────────────
+    writeExcludedCompaniesReport(ss, result.removedRows, result.headers);
+
+    const duration = ((new Date() - startTime) / 1000).toFixed(1);
+    Logger.log(`=== Company Exclusion Complete — ${result.removedRows.length} rows removed in ${duration}s ===`);
+
+    SpreadsheetApp.getUi().alert(
+      '✅ Company Exclusion Complete',
+      `📊 Summary:\n\n` +
+      `  Companies in exclude list:  ${excludeSet.size}\n` +
+      `  Rows removed:               ${result.removedRows.length}\n` +
+      `  Rows remaining:             ${result.remainingCount}\n` +
+      `  Duration:                   ${duration}s\n\n` +
+      `Removed rows have been moved to:\n` +
+      `  → "${EXCLUDE_CONFIG.REPORT_SHEET}" tab`,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+
+    // Switch to the report tab so the user can review it
+    ss.setActiveSheet(ss.getSheetByName(EXCLUDE_CONFIG.REPORT_SHEET));
+
+  } catch (error) {
+    Logger.log('ERROR: ' + error.toString());
+    SpreadsheetApp.getUi().alert(
+      '❌ Error',
+      'Company exclusion failed:\n\n' + error.toString(),
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    throw error;
+  }
+}
+
+// =============================================================================
+// READ EXCLUSION LIST
+// =============================================================================
+
+/**
+ * Reads the Exclude tab and returns a Set of company names (lowercased, trimmed)
+ * for fast case-insensitive exact matching.
+ *
+ * Expects a "Company Name" column header. If not found, reads column A.
+ *
+ * @param {Sheet} excludeSheet
+ * @returns {Set<string>}
+ */
+function readExcludeList(excludeSheet) {
+  const lastRow = excludeSheet.getLastRow();
+  if (lastRow < 2) return new Set(); // No data rows
+
+  const allData    = excludeSheet.getRange(1, 1, lastRow, excludeSheet.getLastColumn()).getValues();
+  const headers    = allData[0].map(h => h.toString().trim());
+  const companyIdx = headers.findIndex(h => h.toLowerCase() === EXCLUDE_CONFIG.COMPANY_COLUMN.toLowerCase());
+
+  // Fall back to column A (index 0) if header not found
+  const colIdx = companyIdx !== -1 ? companyIdx : 0;
+
+  if (companyIdx === -1) {
+    Logger.log(`Warning: "${EXCLUDE_CONFIG.COMPANY_COLUMN}" header not found in Exclude tab. Using column A.`);
+  }
+
+  const excludeSet = new Set();
+  for (let i = 1; i < allData.length; i++) {
+    const name = (allData[i][colIdx] || '').toString().trim().toLowerCase();
+    if (name) excludeSet.add(name);
+  }
+
+  Logger.log(`Read ${excludeSet.size} company names from Exclude tab`);
+  return excludeSet;
+}
+
+// =============================================================================
+// SCAN AND SPLIT ROWS
+// =============================================================================
+
+/**
+ * Scans all rows in the Validation tab.
+ * Returns:
+ *   - headers:             the header row values
+ *   - removedRows:         array of row data arrays that matched the exclude list
+ *   - rowIndicesToRemove:  1-based sheet row numbers to delete (in reverse order)
+ *   - remainingCount:      how many rows will remain after removal
+ *
+ * @param {Sheet}      validationSheet
+ * @param {Set<string>} excludeSet
+ * @returns {{ headers, removedRows, rowIndicesToRemove, remainingCount }}
+ */
+function scanAndSplitRows(validationSheet, excludeSet) {
+  const lastRow = validationSheet.getLastRow();
+  const lastCol = validationSheet.getLastColumn();
+
+  if (lastRow < 2) {
+    return { headers: [], removedRows: [], rowIndicesToRemove: [], remainingCount: 0 };
+  }
+
+  const allData    = validationSheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers    = allData[0].map(h => h.toString().trim());
+  const companyIdx = headers.findIndex(h => h.toLowerCase() === EXCLUDE_CONFIG.COMPANY_COLUMN.toLowerCase());
+
+  if (companyIdx === -1) {
+    throw new Error(
+      `Column "${EXCLUDE_CONFIG.COMPANY_COLUMN}" not found in the "${EXCLUDE_CONFIG.VALIDATION_SHEET}" tab.\n` +
+      `Available headers: ${headers.join(', ')}`
+    );
+  }
+
+  const removedRows        = [];
+  const rowIndicesToRemove = []; // 1-based sheet row indices, collected in order
+  let   remainingCount     = 0;
+
+  for (let i = 1; i < allData.length; i++) {
+    const row         = allData[i];
+    const companyName = (row[companyIdx] || '').toString().trim().toLowerCase();
+
+    if (companyName && excludeSet.has(companyName)) {
+      removedRows.push(row);
+      rowIndicesToRemove.push(i + 1); // +1 because allData[0] is the header, sheet rows are 1-based
+      Logger.log(`Row ${i + 1}: "${row[companyIdx]}" matched — marking for removal`);
+    } else {
+      remainingCount++;
+    }
+  }
+
+  Logger.log(`Found ${removedRows.length} rows to remove, ${remainingCount} rows will remain`);
+
+  return { headers, removedRows, rowIndicesToRemove, remainingCount };
+}
+
+// =============================================================================
+// WRITE EXCLUDED COMPANIES REPORT
+// =============================================================================
+
+/**
+ * Creates or overwrites the "Excluded Companies" tab with all removed rows.
+ * Includes original headers plus an "Excluded Reason" column at the end.
+ *
+ * @param {Spreadsheet} ss
+ * @param {any[][]}     removedRows  - Array of row data arrays
+ * @param {string[]}    headers      - Header row from the Validation tab
+ */
+function writeExcludedCompaniesReport(ss, removedRows, headers) {
+  // Delete existing report sheet if present
+  const existing = ss.getSheetByName(EXCLUDE_CONFIG.REPORT_SHEET);
+  if (existing) ss.deleteSheet(existing);
+
+  const reportSheet = ss.insertSheet(EXCLUDE_CONFIG.REPORT_SHEET);
+
+  // Build headers: all original columns + reason column
+  const reportHeaders = [...headers, 'Excluded Reason'];
+  const reasonColIdx  = reportHeaders.length; // 1-based column index for the reason
+
+  // Write header row
+  reportSheet.getRange(1, 1, 1, reportHeaders.length).setValues([reportHeaders]);
+  reportSheet.getRange(1, 1, 1, reportHeaders.length)
+    .setBackground(EXCLUDE_CONFIG.REPORT_HEADER_BG)
+    .setFontColor('#ffffff')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+
+  // Write data rows
+  if (removedRows.length > 0) {
+    // Add "Matched exclude list" as reason for every row
+    const dataWithReason = removedRows.map(row => [
+      ...row,
+      'Matched company in Exclude tab'
+    ]);
+
+    reportSheet.getRange(2, 1, dataWithReason.length, reportHeaders.length)
+      .setValues(dataWithReason);
+
+    // Highlight the reason column
+    reportSheet.getRange(2, reasonColIdx, dataWithReason.length, 1)
+      .setBackground(EXCLUDE_CONFIG.REASON_BG)
+      .setFontStyle('italic');
+  }
+
+  reportSheet.setFrozenRows(1);
+  for (let c = 1; c <= reportHeaders.length; c++) {
+    reportSheet.autoResizeColumn(c);
+  }
+
+  Logger.log(`Written ${removedRows.length} rows to "${EXCLUDE_CONFIG.REPORT_SHEET}"`);
+}
+
+// =============================================================================
+// REMOVE ROWS FROM VALIDATION SHEET
+// =============================================================================
+
+/**
+ * Deletes the matched rows from the Validation sheet.
+ * Rows are deleted in reverse order so that row indices stay valid
+ * as rows are removed one by one from bottom to top.
+ *
+ * @param {Sheet}    sheet
+ * @param {number[]} rowIndices - 1-based sheet row numbers to delete
+ */
+function removeRowsFromSheet(sheet, rowIndices) {
+  if (rowIndices.length === 0) return;
+
+  // Delete from bottom to top to preserve row indices
+  const reversed = [...rowIndices].reverse();
+  for (const rowIdx of reversed) {
+    sheet.deleteRow(rowIdx);
+  }
+
+  Logger.log(`Deleted ${rowIndices.length} rows from "${EXCLUDE_CONFIG.VALIDATION_SHEET}"`);
+}
+
+// =============================================================================
+// END OF SCRIPT
+// =============================================================================
