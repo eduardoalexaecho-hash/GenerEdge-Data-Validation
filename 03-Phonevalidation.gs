@@ -2,55 +2,64 @@
  * =============================================================================
  * BYTEPLANT PHONE VALIDATION SCRIPT
  * =============================================================================
- * 
+ *
  * Validates phone numbers using Byteplant Real-Time Phone Validation API
- * 
+ *
  * IMPORTANT: This file should be in the same Apps Script project as:
- *            DataCleaningPipeline_V3.gs
- * 
- * The onOpen() function is located in DataCleaningPipeline_V3.gs and creates
- * menus for both scripts.
- * 
+ *            DataCleaningPipeline_V3.gs and EmailValidation.gs
+ *
  * API SPECIFICATION:
  * - Endpoint: https://api.phone-validator.net/api/v2/verify
- * - Method: GET (with query parameters)
+ * - Method: GET
  * - Required Parameters: PhoneNumber, CountryCode, APIKey
  * - Phone Format: National format (e.g., "2109791958") with CountryCode="us"
- *                 OR International format (e.g., "+12109791958") without CountryCode
- * 
+ *
  * STATUS VALUES:
- * - VALID_CONFIRMED: Phone is valid and confirmed active
- * - VALID_UNCONFIRMED: Phone is valid but cannot confirm if active
- * - INVALID: Phone number is invalid
- * - DELAYED: Validation is delayed (async processing)
- * - RATE_LIMIT_EXCEEDED: API rate limit reached
- * - API_KEY_INVALID_OR_DEPLETED: API key issue
- * 
+ * - VALID_CONFIRMED, VALID_UNCONFIRMED, INVALID, DELAYED,
+ *   RATE_LIMIT_EXCEEDED, API_KEY_INVALID_OR_DEPLETED
+ *
  * LINE TYPES:
- * - MOBILE, FIXED_LINE (landline), VOIP, TOLL_FREE, PREMIUM_RATE,
- *   SHARED_COST, PERSONAL_NUMBER, PAGER, UAN, VOICEMAIL
- * 
- * TEST MODE: Processes only the first 5 data rows (rows 2-6)
- * 
- * Features:
- * - Validates 4 phone columns individually:
- *   • Contact Phone 1
- *   • Company Phone 1
- *   • Company Phone 2
- *   • Contact Mobile Phone
- * - Each column validated separately via menu
- * - Creates 4 result columns immediately after each phone column:
- *   • _Status (valid confirmed, invalid, etc.)
- *   • _Line Type (mobile, landline, voip, etc.)
- *   • _Location (city, state)
- *   • _International (formatted phone number)
- * - Result columns have BLUE background with BLACK text
- * - Includes delay between API calls to avoid rate limits
- * - Handles errors gracefully with retry logic
- * - TEST MODE: Validates only rows 2-6 (5 rows) per column
- * 
+ * - MOBILE, FIXED_LINE, VOIP, TOLL_FREE, PREMIUM_RATE, etc.
+ *
+ * FALLBACK CHAIN LOGIC:
+ * - Contact Mobile Phone: no predecessors — validates every eligible row
+ * - Contact Phone 1:  skips row if Contact Mobile Phone passes
+ * - Company Phone 1:  skips row if Contact Mobile Phone OR Contact Phone 1 passes
+ * - Company Phone 2:  skips row if any of the above 3 pass
+ * - "Passes" = VALID_CONFIRMED AND MOBILE
+ * - Skipped rows get "SKIP" written in their _Status cell
+ *
+ * EMAIL PRE-CHECK (all buttons including individual ones):
+ * - Before calling the phone API for any row, checks whether Email 1 has
+ *   status "valid" for that row
+ * - If Email 1 is not valid → writes "NO_EMAIL" to the _Status cell, skips API call
+ * - Saves phone validation credits — no point validating phones for invalid emails
+ *
+ * FULL CHAIN (▶️ Validate All):
+ * - Step 1: Email 1       (via EmailValidation.gs — startEmailValidation_)
+ * - Step 2: Contact Mobile Phone
+ * - Step 3: Contact Phone 1
+ * - Step 4: Company Phone 1
+ * - Step 5: Company Phone 2
+ * - Each step hands off to the next automatically when done
+ * - Time-aware continuation works within each step
+ *
+ * SMART RATE LIMITING:
+ * - No fixed delay between API calls
+ * - Every Byteplant response includes ratelimit_remain and ratelimit_seconds
+ * - Script only waits when ratelimit_remain <= RATE_LIMIT_BUFFER (5 calls left)
+ * - If RATE_LIMIT_EXCEEDED hit anyway, automatically waits and retries
+ * - Goes as fast as Byteplant allows — ~100 calls per 300 seconds
+ *
+ * TIME-AWARE AUTO-CONTINUATION:
+ * - All sheet data read in ONE batch at start of each run (fast)
+ * - Results written immediately after each API call (progress always saved)
+ * - When elapsed time approaches 240s, saves position, schedules 1-min trigger
+ * - continuePhoneValidation() resumes from saved row automatically
+ * - Use "Cancel Running Validation" to stop at any time
+ *
  * @author: Claude
- * @version: 1.3 - Individual column validation with 4 phone columns
+ * @version: 1.8 - Smart rate limit throttling (no fixed delay)
  */
 
 // =============================================================================
@@ -58,533 +67,637 @@
 // =============================================================================
 
 const PHONE_VALIDATION_CONFIG = {
-  // Byteplant API Configuration
-  API_KEY: 'pv-0e4b530a9be44e529631bd5cc323279d',
+  // Byteplant API
+  API_KEY:      'pv-0e4b530a9be44e529631bd5cc323279d',
   API_ENDPOINT: 'https://api.phone-validator.net/api/v2/verify',
-  COUNTRY_CODE: 'us',        // Two-letter ISO 3166-1 country code (use with national format numbers)
-  
-  // Test Mode Settings
-  TEST_MODE: false,          // Set to true to only process 5 rows for testing
-  TEST_ROWS_START: 2,        // First data row (row 2 = first after header)
-  TEST_ROWS_END: 6,          // Last data row for test (row 6 = 5 data rows)
-  
-  // Column Names (must match your sheet headers)
-  PHONE_COLUMNS: [
+  COUNTRY_CODE: 'us',
+
+  // Test Mode
+  TEST_MODE:       false,
+  TEST_ROWS_START: 2,
+  TEST_ROWS_END:   6,
+
+  // Full chain order — Email 1 is handled by EmailValidation.gs as step 1
+  // This array defines the phone steps only
+  CHAIN_STEPS: [
+    'Contact Mobile Phone',
     'Contact Phone 1',
     'Company Phone 1',
-    'Company Phone 2',
-    'Contact Mobile Phone'
+    'Company Phone 2'
   ],
-  
-  // Result Column Suffixes (will be added next to each phone column)
-  RESULT_COLUMNS: {
-    STATUS: '_Status',           // e.g., "Company Phone 1_Status"
-    LINE_TYPE: '_Line Type',     // e.g., "Company Phone 1_Line Type"
-    LOCATION: '_Location',       // e.g., "Company Phone 1_Location"
-    FORMAT: '_International'     // e.g., "Company Phone 1_International"
+
+  // Fallback chain predecessors per phone column
+  FALLBACK_PREDECESSORS: {
+    'Contact Phone 1': ['Contact Mobile Phone'],
+    'Company Phone 1': ['Contact Mobile Phone', 'Contact Phone 1'],
+    'Company Phone 2': ['Contact Mobile Phone', 'Contact Phone 1', 'Company Phone 1']
   },
-  
-  // API Settings
-  DELAY_BETWEEN_CALLS: 500,  // Milliseconds between API calls (0.5 seconds)
-  REQUEST_TIMEOUT: 10000,    // Request timeout in milliseconds (10 seconds)
-  
-  // Error Handling
-  MAX_RETRIES: 2,            // Number of retries on API failure
-  RETRY_DELAY: 1000          // Delay before retry (1 second)
+
+  // Email column to check before validating any phone (all buttons)
+  EMAIL_CHECK_COLUMN: 'Email 1',
+  EMAIL_STATUS_SUFFIX: '_Status',
+  VALID_EMAIL_STATUS:  'valid',
+
+  // Result column suffixes
+  RESULT_COLUMNS: {
+    STATUS:    '_Status',
+    LINE_TYPE: '_Line Type',
+    LOCATION:  '_Location',
+    FORMAT:    '_International'
+  },
+
+  // Passing criteria
+  VALID_STATUS:    'VALID_CONFIRMED',
+  VALID_LINE_TYPE: 'MOBILE',
+
+  // Marker values written to _Status
+  SKIP_MARKER:     'SKIP',      // Higher-priority phone already passed
+  NO_EMAIL_MARKER: 'NO_EMAIL',  // No valid email — phone skipped
+
+  // API settings
+  // No fixed delay — script reads ratelimit_remain and ratelimit_seconds from
+  // every Byteplant response and only waits when actually near the rate limit.
+  // Byteplant allows 100 calls per 300s. We pause when fewer than RATE_LIMIT_BUFFER
+  // calls remain in the current window.
+  RATE_LIMIT_BUFFER:   5,     // pause when this many calls remain in current window
+  REQUEST_TIMEOUT:     10000,
+  MAX_RETRIES:         2,
+  RETRY_DELAY:         2000,  // ms to wait before retrying after a non-rate-limit error
+
+  // Time-aware
+  TIME_LIMIT_SECONDS:         240,
+  CONTINUATION_DELAY_MINUTES: 1
+};
+
+// PropertiesService keys
+const PROPS = {
+  COLUMN:     'phoneVal_column',
+  NEXT_ROW:   'phoneVal_nextRow',
+  END_ROW:    'phoneVal_endRow',
+  SHEET_NAME: 'phoneVal_sheetName',
+  TRIGGER_ID: 'phoneVal_triggerId',
+  IS_RUNNING: 'phoneVal_isRunning',
+  CHAIN_NEXT: 'phoneVal_chainNext'  // next phone column in chain after current one finishes
 };
 
 // =============================================================================
-// MAIN EXECUTION
+// PUBLIC ENTRY POINTS (individual menu buttons)
+// =============================================================================
+
+function validateContactMobilePhone() { startValidation_('Contact Mobile Phone', null); }
+function validateContactPhone1()      { startValidation_('Contact Phone 1',       null); }
+function validateCompanyPhone1()      { startValidation_('Company Phone 1',        null); }
+function validateCompanyPhone2()      { startValidation_('Company Phone 2',        null); }
+
+/**
+ * Full chain entry point — called from the menu.
+ * Starts with Email 1 validation, which automatically hands off to the phone chain.
+ */
+function validateAll() {
+  // Email 1 is step 1 — when it finishes it calls startPhoneChainFromStep_('Contact Mobile Phone')
+  startEmailValidation_('Email 1', 'Contact Mobile Phone');
+}
+
+/**
+ * Called by EmailValidation.gs when Email 1 finishes in full chain mode.
+ * Starts the phone chain from the given step.
+ *
+ * @param {string} firstPhoneStep - First phone column to validate (e.g. 'Contact Mobile Phone')
+ */
+function startPhoneChainFromStep_(firstPhoneStep) {
+  // Find what comes after this step in the chain
+  const chainSteps = PHONE_VALIDATION_CONFIG.CHAIN_STEPS;
+  const currentIdx = chainSteps.indexOf(firstPhoneStep);
+  const chainNext  = currentIdx !== -1 && currentIdx < chainSteps.length - 1
+    ? chainSteps[currentIdx + 1]
+    : null;
+
+  startValidation_(firstPhoneStep, chainNext);
+}
+
+/**
+ * Cancels any in-progress phone validation.
+ */
+function cancelPhoneValidation() {
+  deleteContinuationTrigger_();
+  clearSavedState_();
+  SpreadsheetApp.getUi().alert(
+    '🛑 Validation Cancelled',
+    'The running validation has been cancelled.\n\n' +
+    'All progress already written to the sheet is preserved.\n\n' +
+    'You can click the same column button again to resume —\n' +
+    'already-validated rows will be skipped automatically.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+// =============================================================================
+// CORE ORCHESTRATION
 // =============================================================================
 
 /**
- * Main validation function for a single column
- * @param {string} columnName - The phone column to validate
+ * Prepares result columns, saves state, runs first batch.
+ *
+ * @param {string}      columnName - Phone column to validate
+ * @param {string|null} chainNext  - Next phone column in chain, or null if last/individual
  */
-function validatePhoneColumn_Single(columnName) {
-  try {
-    const startTime = new Date();
-    Logger.log(`=== Starting Phone Validation for ${columnName} ===`);
-    
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheet = ss.getActiveSheet();
-    
-    // Get sheet data
-    const lastRow = sheet.getLastRow();
-    const lastCol = sheet.getLastColumn();
-    
-    // Determine rows to process
-    const startRow = PHONE_VALIDATION_CONFIG.TEST_ROWS_START;
-    const endRow = PHONE_VALIDATION_CONFIG.TEST_MODE 
-      ? Math.min(PHONE_VALIDATION_CONFIG.TEST_ROWS_END, lastRow)
-      : lastRow;
-    
-    Logger.log(`Processing rows ${startRow} to ${endRow}`);
-    Logger.log(`Test mode: ${PHONE_VALIDATION_CONFIG.TEST_MODE}`);
-    
-    // Step 1: Prepare result columns for this phone column
-    Logger.log('Step 1: Preparing result columns...');
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    prepareResultColumnsForPhone(sheet, headers, columnName);
-    
-    // Step 2: Get updated headers after adding columns
-    const updatedHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    
-    // Step 3: Validate all rows for this phone column
-    Logger.log('Step 2: Validating phone numbers...');
-    const result = validatePhoneColumn(
-      sheet,
-      updatedHeaders,
-      columnName,
-      startRow,
-      endRow
-    );
-    
-    const endTime = new Date();
-    const duration = (endTime - startTime) / 1000;
-    
-    Logger.log('\n=== Validation Complete ===');
-    Logger.log(`Column: ${columnName}`);
-    Logger.log(`Rows processed: ${startRow}-${endRow} (${endRow - startRow + 1} rows)`);
-    Logger.log(`Phone numbers processed: ${result.processed}`);
-    Logger.log(`Successfully validated: ${result.validated}`);
-    Logger.log(`Errors: ${result.errors}`);
-    Logger.log(`Duration: ${duration.toFixed(2)}s`);
-    
-    // Show success message
+function startValidation_(columnName, chainNext) {
+  const props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty(PROPS.IS_RUNNING) === 'true') {
+    const runningCol = props.getProperty(PROPS.COLUMN) || '(unknown)';
     SpreadsheetApp.getUi().alert(
-      `${columnName} - Validation Complete`,
-      `Phone validation complete for ${columnName}!\n\n` +
-      `Rows: ${startRow}-${endRow}\n` +
-      `Processed: ${result.processed} phone numbers\n` +
-      `Validated: ${result.validated}\n` +
-      `Errors: ${result.errors}\n` +
-      `Duration: ${duration.toFixed(2)}s\n\n` +
-      `${PHONE_VALIDATION_CONFIG.TEST_MODE ? '✓ TEST MODE (5 rows only)' : '✓ FULL MODE'}`,
+      '⚠️ Already Running',
+      `A phone validation is already in progress for:\n"${runningCol}"\n\n` +
+      'Wait for it to finish, or cancel it first:\n' +
+      '📞 Phone Validation → 🛑 Cancel Running Validation',
       SpreadsheetApp.getUi().ButtonSet.OK
     );
-    
-  } catch (error) {
-    Logger.log('ERROR: ' + error.toString());
-    SpreadsheetApp.getUi().alert(
-      'Error',
-      `Phone validation failed for ${columnName}: ` + error.toString(),
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
-    throw error;
+    return;
   }
+
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet   = ss.getActiveSheet();
+  const lastRow = sheet.getLastRow();
+
+  const startRow = PHONE_VALIDATION_CONFIG.TEST_ROWS_START;
+  const endRow   = PHONE_VALIDATION_CONFIG.TEST_MODE
+    ? Math.min(PHONE_VALIDATION_CONFIG.TEST_ROWS_END, lastRow)
+    : lastRow;
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  prepareResultColumnsForPhone_(sheet, headers, columnName);
+
+  props.setProperties({
+    [PROPS.COLUMN]:     columnName,
+    [PROPS.NEXT_ROW]:   String(startRow),
+    [PROPS.END_ROW]:    String(endRow),
+    [PROPS.SHEET_NAME]: sheet.getName(),
+    [PROPS.IS_RUNNING]: 'true',
+    [PROPS.CHAIN_NEXT]: chainNext || ''
+  });
+
+  Logger.log(`=== Starting phone validation: "${columnName}", rows ${startRow}–${endRow} ===`);
+  Logger.log(`Chain next: ${chainNext || 'none'}`);
+
+  ss.toast(
+    `Validating "${columnName}" — rows ${startRow} to ${endRow}. Running in background.`,
+    '📞 Phone Validation Started', 8
+  );
+
+  runBatch_();
 }
 
 /**
- * Validate Contact Phone 1 column (5 rows in test mode)
+ * Called by the time-based trigger to resume a paused phone validation.
  */
-function validateContactPhone1() {
-  validatePhoneColumn_Single('Contact Phone 1');
+function continuePhoneValidation() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty(PROPS.IS_RUNNING) !== 'true') {
+    deleteContinuationTrigger_();
+    Logger.log('continuePhoneValidation: no active run. Cleaned up stale trigger.');
+    return;
+  }
+  Logger.log('=== Continuing phone validation (trigger fired) ===');
+  runBatch_();
 }
 
 /**
- * Validate Company Phone 1 column (5 rows in test mode)
+ * Core batch loop.
+ * Reads all sheet data upfront, processes rows in memory, flushes writes at end.
  */
-function validateCompanyPhone1() {
-  validatePhoneColumn_Single('Company Phone 1');
-}
+function runBatch_() {
+  const batchStart = new Date();
+  const props      = PropertiesService.getScriptProperties();
 
-/**
- * Validate Company Phone 2 column (5 rows in test mode)
- */
-function validateCompanyPhone2() {
-  validatePhoneColumn_Single('Company Phone 2');
-}
+  const columnName = props.getProperty(PROPS.COLUMN);
+  const nextRow    = parseInt(props.getProperty(PROPS.NEXT_ROW), 10);
+  const endRow     = parseInt(props.getProperty(PROPS.END_ROW),  10);
+  const sheetName  = props.getProperty(PROPS.SHEET_NAME);
+  const chainNext  = props.getProperty(PROPS.CHAIN_NEXT) || '';
 
-/**
- * Validate Contact Mobile Phone column (5 rows in test mode)
- */
-function validateContactMobilePhone() {
-  validatePhoneColumn_Single('Contact Mobile Phone');
+  if (!columnName || isNaN(nextRow) || isNaN(endRow)) {
+    Logger.log('ERROR: Incomplete saved state. Aborting.');
+    clearSavedState_();
+    deleteContinuationTrigger_();
+    return;
+  }
+
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName) || ss.getActiveSheet();
+
+  // ── Read ALL data in one batch ────────────────────────────────────────────
+  const lastCol   = sheet.getLastColumn();
+  const totalRows = sheet.getLastRow();
+  const allData   = sheet.getRange(1, 1, totalRows, lastCol).getValues();
+  const headers   = allData[0].map(h => h.toString().trim());
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Resolve column indices
+  const predecessors     = PHONE_VALIDATION_CONFIG.FALLBACK_PREDECESSORS[columnName] || [];
+  const phoneColIndex    = headers.indexOf(columnName);
+  const statusColIndex   = headers.indexOf(columnName + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.STATUS);
+  const lineTypeColIndex = headers.indexOf(columnName + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LINE_TYPE);
+  const locationColIndex = headers.indexOf(columnName + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LOCATION);
+  const formatColIndex   = headers.indexOf(columnName + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.FORMAT);
+
+  if (phoneColIndex === -1 || statusColIndex === -1) {
+    Logger.log(`ERROR: Required columns not found for "${columnName}". Aborting.`);
+    clearSavedState_();
+    deleteContinuationTrigger_();
+    return;
+  }
+
+  // Predecessor index pairs for in-memory fallback chain check
+  const predecessorIndices = predecessors.map(pred => ({
+    statusIdx:   headers.indexOf(pred + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.STATUS),
+    lineTypeIdx: headers.indexOf(pred + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LINE_TYPE)
+  }));
+
+  // Email 1 status column index for pre-check
+  const emailCheckCol    = PHONE_VALIDATION_CONFIG.EMAIL_CHECK_COLUMN;
+  const emailStatusIdx   = headers.indexOf(emailCheckCol + PHONE_VALIDATION_CONFIG.EMAIL_STATUS_SUFFIX);
+  const hasEmailCheck    = emailStatusIdx !== -1;
+
+  if (!hasEmailCheck) {
+    Logger.log(`Warning: "${emailCheckCol}_Status" column not found — email pre-check disabled for this run`);
+  }
+
+  let processed      = 0;
+  let validated      = 0;
+  let skippedByChain = 0;
+  let skippedAlready = 0;
+  let skippedNoEmail = 0;
+  let errors         = 0;
+  let lastRowReached = nextRow - 1;
+  let timedOut       = false;
+
+  for (let row = nextRow; row <= endRow; row++) {
+    const rowData = allData[row - 1];
+    const dataIdx = row - 1;
+
+    // ── TIME CHECK ────────────────────────────────────────────────────────────
+    const elapsed = (new Date() - batchStart) / 1000;
+    if (elapsed >= PHONE_VALIDATION_CONFIG.TIME_LIMIT_SECONDS) {
+      Logger.log(`Time limit hit at row ${row} (${elapsed.toFixed(1)}s). Pausing.`);
+      props.setProperty(PROPS.NEXT_ROW, String(row));
+      timedOut = true;
+      break;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    lastRowReached = row;
+
+    // ── FALLBACK CHAIN CHECK (in-memory) ─────────────────────────────────────
+    if (predecessorIndices.length > 0) {
+      let predecessorPassed = false;
+      for (const pred of predecessorIndices) {
+        if (pred.statusIdx === -1 || pred.lineTypeIdx === -1) continue;
+        const predStatus   = (rowData[pred.statusIdx]   || '').toString().trim().toUpperCase();
+        const predLineType = (rowData[pred.lineTypeIdx] || '').toString().trim().toUpperCase();
+        if (predStatus   === PHONE_VALIDATION_CONFIG.VALID_STATUS &&
+            predLineType === PHONE_VALIDATION_CONFIG.VALID_LINE_TYPE) {
+          predecessorPassed = true;
+          break;
+        }
+      }
+      if (predecessorPassed) {
+        const current = (rowData[statusColIndex] || '').toString().trim();
+        if (current === '' || current === PHONE_VALIDATION_CONFIG.SKIP_MARKER) {
+          SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName).getRange(row, statusColIndex + 1).setValue(PHONE_VALIDATION_CONFIG.SKIP_MARKER);
+        }
+        skippedByChain++;
+        continue;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const phoneNumber = (rowData[phoneColIndex] || '').toString().trim();
+    if (!phoneNumber) continue;
+
+    // Skip already-validated rows (re-validate DELAYED)
+    const existingStatus = (rowData[statusColIndex] || '').toString().trim();
+    if (existingStatus !== '' &&
+        existingStatus !== PHONE_VALIDATION_CONFIG.SKIP_MARKER &&
+        existingStatus !== PHONE_VALIDATION_CONFIG.NO_EMAIL_MARKER) {
+      if (existingStatus.toUpperCase() !== 'DELAYED') {
+        skippedAlready++;
+        continue;
+      }
+      Logger.log(`Row ${row}: DELAYED — re-validating`);
+    }
+
+    // ── EMAIL PRE-CHECK (in-memory) ───────────────────────────────────────────
+    if (hasEmailCheck) {
+      const emailStatus = (rowData[emailStatusIdx] || '').toString().trim().toLowerCase();
+      if (emailStatus !== PHONE_VALIDATION_CONFIG.VALID_EMAIL_STATUS) {
+        SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName).getRange(row, statusColIndex + 1).setValue(PHONE_VALIDATION_CONFIG.NO_EMAIL_MARKER);
+        skippedNoEmail++;
+        Logger.log(`Row ${row}: Email 1 not valid ("${emailStatus}") — skipping phone API call`);
+        continue;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── API CALL ─────────────────────────────────────────────────────────────
+    processed++;
+    Logger.log(`Row ${row}: Validating ${phoneNumber}`);
+
+    const result = validatePhoneWithAPI_(phoneNumber);
+
+    // Write result immediately so progress is never lost if script times out
+    const activeSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+    if (result.success) {
+      activeSheet.getRange(row, statusColIndex   + 1).setValue(result.phone_status        || '');
+      activeSheet.getRange(row, lineTypeColIndex + 1).setValue(result.line_type            || '');
+      activeSheet.getRange(row, locationColIndex + 1).setValue(result.location             || '');
+      activeSheet.getRange(row, formatColIndex   + 1).setValue(result.format_international || '');
+      validated++;
+      Logger.log(`Row ${row}: ✓ ${result.phone_status} / ${result.line_type}`);
+    } else {
+      activeSheet.getRange(row, statusColIndex   + 1).setValue('ERROR: ' + result.error);
+      activeSheet.getRange(row, lineTypeColIndex + 1).setValue('');
+      activeSheet.getRange(row, locationColIndex + 1).setValue('');
+      activeSheet.getRange(row, formatColIndex   + 1).setValue('');
+      errors++;
+      Logger.log(`Row ${row}: ✗ ${result.error}`);
+    }
+    SpreadsheetApp.flush();
+
+    // Smart throttle: if Byteplant says we are near the rate limit,
+    // wait for the current window to reset before the next call.
+    // result.ratelimit_remain and result.ratelimit_seconds come from the API response.
+    if (result.success && result.ratelimit_remain !== undefined) {
+      if (result.ratelimit_remain <= PHONE_VALIDATION_CONFIG.RATE_LIMIT_BUFFER) {
+        const waitMs = Math.max(0, (result.ratelimit_seconds || 10)) * 1000;
+        Logger.log(`Rate limit buffer hit (${result.ratelimit_remain} calls left). Waiting ${waitMs}ms...`);
+        Utilities.sleep(waitMs + 500); // extra 500ms buffer
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+  }
+
+  // Flush any pending Sheets writes
+  SpreadsheetApp.flush();
+
+  // ── CONTINUATION OR COMPLETION ────────────────────────────────────────────
+  if (timedOut) {
+    const resumeAt = parseInt(props.getProperty(PROPS.NEXT_ROW), 10);
+    scheduleContinuationTrigger_();
+
+    Logger.log(`Pausing. Resuming at row ${resumeAt} in ${PHONE_VALIDATION_CONFIG.CONTINUATION_DELAY_MINUTES} min.`);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `Phone validation processed up to row ${lastRowReached}. ` +
+      `Resuming at row ${resumeAt} in ${PHONE_VALIDATION_CONFIG.CONTINUATION_DELAY_MINUTES} minute(s)…`,
+      '⏱️ Auto-Continuing in Background', 30
+    );
+
+  } else {
+    // This column is fully done
+    deleteContinuationTrigger_();
+    clearSavedState_();
+
+    const duration = ((new Date() - batchStart) / 1000).toFixed(1);
+    Logger.log(`=== Phone validation complete for "${columnName}" ===`);
+
+    if (chainNext) {
+      // Auto-start next phone column in chain
+      Logger.log(`Full chain: "${columnName}" done. Starting next: "${chainNext}"`);
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        `"${columnName}" done. Starting "${chainNext}"…`,
+        `✅ Moving to Next Step`, 8
+      );
+
+      // Find what comes after chainNext in the chain
+      const chainSteps   = PHONE_VALIDATION_CONFIG.CHAIN_STEPS;
+      const nextIdx      = chainSteps.indexOf(chainNext);
+      const afterNext    = nextIdx !== -1 && nextIdx < chainSteps.length - 1
+        ? chainSteps[nextIdx + 1]
+        : null;
+
+      startValidation_(chainNext, afterNext);
+
+    } else {
+      // Last step or individual run — show completion alert
+      const isChainEnd = PHONE_VALIDATION_CONFIG.CHAIN_STEPS.includes(columnName);
+      SpreadsheetApp.getUi().alert(
+        `✅ ${columnName} — Complete`,
+        `Phone validation finished for "${columnName}"!\n\n` +
+        `📊 Summary:\n` +
+        `  Rows checked:                       ${PHONE_VALIDATION_CONFIG.TEST_ROWS_START}–${endRow}\n` +
+        `  API calls made:                     ${processed}\n` +
+        `  Successfully validated:             ${validated}\n` +
+        `  Skipped — chain (SKIP):             ${skippedByChain}\n` +
+        `  Skipped — no valid email (NO_EMAIL):${skippedNoEmail}\n` +
+        `  Skipped — already validated:        ${skippedAlready}\n` +
+        `  Errors:                             ${errors}\n` +
+        `  Duration (this batch):              ${duration}s\n\n` +
+        `${isChainEnd && !chainNext ? '🏁 Full chain complete — all columns done!' : ''}\n` +
+        `${PHONE_VALIDATION_CONFIG.TEST_MODE ? '⚠️ TEST MODE — rows 2–6 only' : '✓ FULL MODE — all rows'}`,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
+  }
 }
 
 // =============================================================================
 // COLUMN PREPARATION
 // =============================================================================
 
-/**
- * Prepares result columns immediately after a specific phone column
- * Inserts 4 columns: Status, Line Type, Location, International
- * Applies blue background with black text formatting
- */
-function prepareResultColumnsForPhone(sheet, headers, phoneColumn) {
-  Logger.log(`Preparing result columns for: ${phoneColumn}`);
-  
+function prepareResultColumnsForPhone_(sheet, headers, phoneColumn) {
   const phoneColIndex = headers.indexOf(phoneColumn);
-  
   if (phoneColIndex === -1) {
-    Logger.log(`Warning: Column "${phoneColumn}" not found`);
+    Logger.log(`Warning: "${phoneColumn}" not found — cannot prepare result columns`);
     return;
   }
-  
-  // Define result column names
+
   const statusColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.STATUS;
-  const lineTypeColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LINE_TYPE;
-  const locationColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LOCATION;
-  const formatColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.FORMAT;
-  
-  // Check if columns already exist
   if (headers.includes(statusColName)) {
-    Logger.log(`Result columns already exist for ${phoneColumn}`);
+    Logger.log(`Result columns already exist for "${phoneColumn}"`);
     return;
   }
-  
-  // Insert 4 new columns immediately after the phone column
-  // phoneColIndex is 0-based, but insertColumnsAfter uses 1-based
+
   const insertAfterCol = phoneColIndex + 1;
   sheet.insertColumnsAfter(insertAfterCol, 4);
-  
-  // Set headers for the 4 new columns
-  const headerRow = 1;
-  const firstNewCol = insertAfterCol + 1; // First column after phone column
-  
-  sheet.getRange(headerRow, firstNewCol).setValue(statusColName);
-  sheet.getRange(headerRow, firstNewCol + 1).setValue(lineTypeColName);
-  sheet.getRange(headerRow, firstNewCol + 2).setValue(locationColName);
-  sheet.getRange(headerRow, firstNewCol + 3).setValue(formatColName);
-  
-  // Format headers: Blue background (#4285f4), Black text, Bold
-  const headerRange = sheet.getRange(headerRow, firstNewCol, 1, 4);
-  headerRange
+
+  const firstNewCol = insertAfterCol + 1;
+  sheet.getRange(1, firstNewCol    ).setValue(phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.STATUS);
+  sheet.getRange(1, firstNewCol + 1).setValue(phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LINE_TYPE);
+  sheet.getRange(1, firstNewCol + 2).setValue(phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LOCATION);
+  sheet.getRange(1, firstNewCol + 3).setValue(phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.FORMAT);
+
+  sheet.getRange(1, firstNewCol, 1, 4)
     .setBackground('#4285f4')
     .setFontColor('#000000')
     .setFontWeight('bold');
-  
-  Logger.log(`Created 4 result columns after ${phoneColumn} (column ${insertAfterCol})`);
+
+  Logger.log(`Created 4 result columns after "${phoneColumn}"`);
 }
 
 // =============================================================================
-// PHONE VALIDATION
+// TRIGGER MANAGEMENT
+// =============================================================================
+
+function scheduleContinuationTrigger_() {
+  deleteContinuationTrigger_();
+
+  const trigger = ScriptApp.newTrigger('continuePhoneValidation')
+    .timeBased()
+    .after(PHONE_VALIDATION_CONFIG.CONTINUATION_DELAY_MINUTES * 60 * 1000)
+    .create();
+
+  PropertiesService.getScriptProperties()
+    .setProperty(PROPS.TRIGGER_ID, trigger.getUniqueId());
+
+  Logger.log(`Scheduled phone continuation trigger: ${trigger.getUniqueId()}`);
+}
+
+function deleteContinuationTrigger_() {
+  const props     = PropertiesService.getScriptProperties();
+  const triggerId = props.getProperty(PROPS.TRIGGER_ID);
+  if (!triggerId) return;
+
+  for (const t of ScriptApp.getProjectTriggers()) {
+    if (t.getUniqueId() === triggerId) {
+      ScriptApp.deleteTrigger(t);
+      Logger.log(`Deleted phone trigger: ${triggerId}`);
+      break;
+    }
+  }
+  props.deleteProperty(PROPS.TRIGGER_ID);
+}
+
+function clearSavedState_() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(PROPS.COLUMN);
+  props.deleteProperty(PROPS.NEXT_ROW);
+  props.deleteProperty(PROPS.END_ROW);
+  props.deleteProperty(PROPS.SHEET_NAME);
+  props.deleteProperty(PROPS.IS_RUNNING);
+  props.deleteProperty(PROPS.CHAIN_NEXT);
+  Logger.log('Cleared phone saved state');
+}
+
+// =============================================================================
+// BYTEPLANT API
 // =============================================================================
 
 /**
- * Validates all phone numbers in a specific column
+ * Calls the Byteplant API to validate a single phone number.
+ *
+ * SMART RATE LIMITING:
+ * - Returns ratelimit_remain and ratelimit_seconds from every response
+ * - The caller (runBatch_) uses those to decide whether to wait before the next call
+ * - If RATE_LIMIT_EXCEEDED is returned (hit limit mid-run), this function
+ *   automatically waits ratelimit_seconds then retries — transparent to the caller
+ *
+ * @param {string} phoneNumber
+ * @returns {{
+ *   success: boolean,
+ *   phone_status?: string,
+ *   line_type?: string,
+ *   location?: string,
+ *   format_international?: string,
+ *   ratelimit_remain?: number,
+ *   ratelimit_seconds?: number,
+ *   error?: string
+ * }}
  */
-function validatePhoneColumn(sheet, headers, phoneColumn, startRow, endRow) {
-  const phoneColIndex = headers.indexOf(phoneColumn);
-  
-  if (phoneColIndex === -1) {
-    Logger.log(`Column "${phoneColumn}" not found, skipping`);
-    return { processed: 0, validated: 0, errors: 0 };
-  }
-  
-  // Find result column indices
-  const statusColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.STATUS;
-  const lineTypeColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LINE_TYPE;
-  const locationColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.LOCATION;
-  const formatColName = phoneColumn + PHONE_VALIDATION_CONFIG.RESULT_COLUMNS.FORMAT;
-  
-  const statusColIndex = headers.indexOf(statusColName);
-  const lineTypeColIndex = headers.indexOf(lineTypeColName);
-  const locationColIndex = headers.indexOf(locationColName);
-  const formatColIndex = headers.indexOf(formatColName);
-  
-  if (statusColIndex === -1) {
-    Logger.log(`Result columns not found for ${phoneColumn}, skipping`);
-    return { processed: 0, validated: 0, errors: 0 };
-  }
-  
-  let processed = 0;
-  let validated = 0;
-  let errors = 0;
-  
-  // Process each row
-  for (let row = startRow; row <= endRow; row++) {
-    const phoneNumber = sheet.getRange(row, phoneColIndex + 1).getValue();
-    
-    // Skip empty cells
-    if (!phoneNumber || phoneNumber.toString().trim() === '') {
-      Logger.log(`Row ${row}: Empty phone number, skipping`);
-      continue;
-    }
-    
-    // ✅ SKIP if already validated (but RE-VALIDATE if DELAYED)
-    const existingStatus = sheet.getRange(row, statusColIndex + 1).getValue();
-    if (existingStatus && existingStatus.toString().trim() !== '') {
-      const statusUpper = existingStatus.toString().trim().toUpperCase();
-      
-      // Re-validate DELAYED (it's temporary, needs another check)
-      if (statusUpper === 'DELAYED') {
-        Logger.log(`Row ${row}: Status is DELAYED, re-validating...`);
-        // Don't skip - continue to validation
-      } else {
-        // Skip all other statuses (VALID_CONFIRMED, INVALID, ERROR, etc.)
-        Logger.log(`Row ${row}: Already validated (status: ${existingStatus}), skipping`);
-        continue;
-      }
-    }
-    
-    processed++;
-    Logger.log(`Row ${row}: Validating ${phoneNumber}`);
-    
-    // Validate phone number
-    const result = validatePhoneWithAPI(phoneNumber.toString().trim());
-    
-    if (result.success) {
-      // Write results to sheet (4 columns)
-      sheet.getRange(row, statusColIndex + 1).setValue(result.phone_status || '');
-      sheet.getRange(row, lineTypeColIndex + 1).setValue(result.line_type || '');
-      sheet.getRange(row, locationColIndex + 1).setValue(result.location || '');
-      sheet.getRange(row, formatColIndex + 1).setValue(result.format_international || '');
-      
-      validated++;
-      Logger.log(`Row ${row}: ✓ Valid - Status: ${result.phone_status}, Type: ${result.line_type}, Location: ${result.location}`);
-    } else {
-      // Write error to status column, clear others
-      sheet.getRange(row, statusColIndex + 1).setValue('ERROR: ' + result.error);
-      sheet.getRange(row, lineTypeColIndex + 1).setValue('');
-      sheet.getRange(row, locationColIndex + 1).setValue('');
-      sheet.getRange(row, formatColIndex + 1).setValue('');
-      
-      errors++;
-      Logger.log(`Row ${row}: ✗ Error - ${result.error}`);
-    }
-    
-    // Add delay between API calls (except for last row)
-    if (row < endRow) {
-      Utilities.sleep(PHONE_VALIDATION_CONFIG.DELAY_BETWEEN_CALLS);
-    }
-  }
-  
-  return { processed, validated, errors };
-}
+function validatePhoneWithAPI_(phoneNumber) {
+  const { API_KEY, API_ENDPOINT, COUNTRY_CODE, MAX_RETRIES, RETRY_DELAY, REQUEST_TIMEOUT } = PHONE_VALIDATION_CONFIG;
+  const formatted = phoneNumber.toString().trim();
 
-/**
- * Calls the Byteplant API to validate a phone number
- */
-function validatePhoneWithAPI(phoneNumber) {
-  const apiKey = PHONE_VALIDATION_CONFIG.API_KEY;
-  const endpoint = PHONE_VALIDATION_CONFIG.API_ENDPOINT;
-  const countryCode = PHONE_VALIDATION_CONFIG.COUNTRY_CODE;
-  
-  // Phone number in national format (no need to add +1)
-  const formattedPhone = phoneNumber.toString().trim();
-  
-  // Try with retries
-  for (let attempt = 1; attempt <= PHONE_VALIDATION_CONFIG.MAX_RETRIES + 1; attempt++) {
+  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
     try {
-      Logger.log(`API call attempt ${attempt}: ${formattedPhone}`);
-      
-      // Build URL with query parameters (GET method)
-      // Byteplant accepts both GET and POST, GET is simpler
-      const encodedPhone = encodeURIComponent(formattedPhone);
-      const url = `${endpoint}?PhoneNumber=${encodedPhone}&CountryCode=${countryCode}&APIKey=${apiKey}`;
-      
-      const options = {
-        method: 'get',
-        muteHttpExceptions: true,
-        timeout: PHONE_VALIDATION_CONFIG.REQUEST_TIMEOUT
-      };
-      
-      const response = UrlFetchApp.fetch(url, options);
-      const responseCode = response.getResponseCode();
-      const responseText = response.getContentText();
-      
-      Logger.log(`Response code: ${responseCode}`);
-      Logger.log(`Response: ${responseText.substring(0, 200)}`); // Log first 200 chars
-      
-      if (responseCode === 200) {
-        const data = JSON.parse(responseText);
-        
-        // Check status field
-        if (!data.status) {
-          return {
-            success: false,
-            error: 'No status in API response'
-          };
-        }
-        
+      const url      = `${API_ENDPOINT}?PhoneNumber=${encodeURIComponent(formatted)}&CountryCode=${COUNTRY_CODE}&APIKey=${API_KEY}`;
+      const response = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true, timeout: REQUEST_TIMEOUT });
+      const code     = response.getResponseCode();
+      const text     = response.getContentText();
+
+      Logger.log(`Attempt ${attempt} — HTTP ${code}: ${text.substring(0, 150)}`);
+
+      if (code === 200) {
+        const data = JSON.parse(text);
+        if (!data.status) return { success: false, error: 'No status in API response' };
+
         const status = data.status.toUpperCase();
-        
-        // Handle different status codes
-        if (status === 'VALID_CONFIRMED') {
-          return {
-            success: true,
-            phone_status: data.status,  // Keep EXACT API value: VALID_CONFIRMED
-            line_type: data.linetype || '',  // Keep EXACT API value: FIXED_LINE, MOBILE, etc.
-            location: data.location || '',
-            format_international: data.formatinternational || formattedPhone
-          };
-        } else if (status === 'VALID_UNCONFIRMED') {
-          return {
-            success: true,
-            phone_status: data.status,  // Keep EXACT API value: VALID_UNCONFIRMED
-            line_type: data.linetype || '',  // Keep EXACT API value
-            location: data.location || '',
-            format_international: data.formatinternational || formattedPhone
-          };
-        } else if (status === 'INVALID') {
-          return {
-            success: true,
-            phone_status: data.status,  // Keep EXACT API value: INVALID
-            line_type: '',
-            location: '',
-            format_international: ''
-          };
-        } else if (status === 'RATE_LIMIT_EXCEEDED') {
-          return {
-            success: false,
-            error: 'Rate limit exceeded. Wait and try again.'
-          };
-        } else if (status === 'API_KEY_INVALID_OR_DEPLETED') {
-          return {
-            success: false,
-            error: 'API key invalid or depleted'
-          };
-        } else if (status === 'DELAYED') {
-          return {
-            success: true,
-            phone_status: data.status,  // Keep EXACT API value: DELAYED
-            line_type: data.linetype || '',  // Keep EXACT API value
-            location: data.location || '',
-            format_international: data.formatinternational || formattedPhone
-          };
-        } else {
-          // Unknown status - keep exact API value
-          return {
-            success: true,
-            phone_status: data.status,  // Keep whatever API returns (uppercase)
-            line_type: data.linetype || '',  // Keep EXACT API value
-            location: data.location || '',
-            format_international: data.formatinternational || formattedPhone
-          };
+
+        // ── Rate limit hit — wait and retry automatically ─────────────────────
+        if (status === 'RATE_LIMIT_EXCEEDED') {
+          const waitSeconds = parseInt(data.ratelimit_seconds || 10, 10);
+          const waitMs      = (waitSeconds + 1) * 1000; // +1s buffer
+          Logger.log(`RATE_LIMIT_EXCEEDED on attempt ${attempt}. Waiting ${waitMs}ms then retrying...`);
+          Utilities.sleep(waitMs);
+          continue; // retry same attempt after waiting
         }
-      } else {
-        // Non-200 response
-        Logger.log(`API returned ${responseCode}: ${responseText}`);
-        
-        if (attempt <= PHONE_VALIDATION_CONFIG.MAX_RETRIES) {
-          Logger.log(`Retrying in ${PHONE_VALIDATION_CONFIG.RETRY_DELAY}ms...`);
-          Utilities.sleep(PHONE_VALIDATION_CONFIG.RETRY_DELAY);
-          continue;
+        // ─────────────────────────────────────────────────────────────────────
+
+        if (status === 'API_KEY_INVALID_OR_DEPLETED') {
+          return { success: false, error: 'API key invalid or depleted' };
         }
-        
+
+        const isInvalid = status === 'INVALID';
         return {
-          success: false,
-          error: `API error ${responseCode}`
+          success:              true,
+          phone_status:         data.status,
+          line_type:            isInvalid ? '' : (data.linetype             || ''),
+          location:             isInvalid ? '' : (data.location              || ''),
+          format_international: isInvalid ? '' : (data.formatinternational   || formatted),
+          // Pass rate limit info back so the loop can throttle proactively
+          ratelimit_remain:  parseInt(data.ratelimit_remain  || 100, 10),
+          ratelimit_seconds: parseInt(data.ratelimit_seconds || 0,   10)
         };
+
+      } else {
+        if (attempt <= MAX_RETRIES) { Utilities.sleep(RETRY_DELAY); continue; }
+        return { success: false, error: `API error ${code}` };
       }
-      
-    } catch (error) {
-      Logger.log(`Attempt ${attempt} failed: ${error.toString()}`);
-      
-      if (attempt <= PHONE_VALIDATION_CONFIG.MAX_RETRIES) {
-        Logger.log(`Retrying in ${PHONE_VALIDATION_CONFIG.RETRY_DELAY}ms...`);
-        Utilities.sleep(PHONE_VALIDATION_CONFIG.RETRY_DELAY);
-        continue;
-      }
-      
-      return {
-        success: false,
-        error: error.toString().substring(0, 100)
-      };
+
+    } catch (err) {
+      if (attempt <= MAX_RETRIES) { Utilities.sleep(RETRY_DELAY); continue; }
+      return { success: false, error: err.toString().substring(0, 100) };
     }
   }
-  
-  return {
-    success: false,
-    error: 'Max retries exceeded'
-  };
+
+  return { success: false, error: 'Max retries exceeded' };
 }
 
-/**
- * Formats line type from API response to readable format
- */
-// NO LONGER USED - Now using exact API response values
-// function formatLineType(linetype) {
-//   if (!linetype) return '';
-//   
-//   // Convert from MOBILE, FIXED_LINE, etc. to readable format
-//   const typeMap = {
-//     'MOBILE': 'mobile',
-//     'FIXED_LINE': 'landline',
-//     'VOIP': 'voip',
-//     'TOLL_FREE': 'toll-free',
-//     'PREMIUM_RATE': 'premium',
-//     'SHARED_COST': 'shared cost',
-//     'PERSONAL_NUMBER': 'personal',
-//     'PAGER': 'pager',
-//     'UAN': 'uan',
-//     'VOICEMAIL': 'voicemail'
-//   };
-//   
-//   const upper = linetype.toUpperCase();
-//   return typeMap[upper] || linetype.toLowerCase();
-// }
-
 // =============================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS (menu items)
 // =============================================================================
 
-/**
- * Shows configuration dialog
- */
 function showConfigDialog() {
-  const config = PHONE_VALIDATION_CONFIG;
-  const message = 
-    'Current Configuration:\n\n' +
-    `Test Mode: ${config.TEST_MODE ? 'ENABLED' : 'DISABLED'}\n` +
-    `Test Rows: ${config.TEST_ROWS_START}-${config.TEST_ROWS_END}\n` +
-    `Delay: ${config.DELAY_BETWEEN_CALLS}ms\n` +
-    `Max Retries: ${config.MAX_RETRIES}\n\n` +
-    'To change settings, edit the PHONE_VALIDATION_CONFIG object in the script editor.\n\n' +
-    'To process ALL rows:\n' +
-    '1. Set TEST_MODE = false\n' +
-    '2. Save and refresh the sheet\n' +
-    '3. Run validation again';
-  
-  SpreadsheetApp.getUi().alert('Configuration', message, SpreadsheetApp.getUi().ButtonSet.OK);
+  const cfg = PHONE_VALIDATION_CONFIG;
+  SpreadsheetApp.getUi().alert(
+    '⚙️ Phone Validation — Configuration',
+    'Current Settings:\n\n' +
+    `Test Mode:            ${cfg.TEST_MODE ? 'ENABLED (rows 2–6 only)' : 'DISABLED (all rows)'}\n` +
+    `Email pre-check:      Email 1 must be "valid" before any phone API call\n` +
+    `Rate limit buffer:    Waits when ${cfg.RATE_LIMIT_BUFFER} calls remain in window\n` +
+    `Max Retries:          ${cfg.MAX_RETRIES}\n` +
+    `Time Limit Per Run:   ${cfg.TIME_LIMIT_SECONDS}s\n` +
+    `Continuation Delay:   ${cfg.CONTINUATION_DELAY_MINUTES} minute(s)\n\n` +
+    'Full Chain Order:\n' +
+    '  1. Email 1               (ZeroBounce)\n' +
+    '  2. Contact Mobile Phone  (Byteplant — no predecessors)\n' +
+    '  3. Contact Phone 1       (skips row if Mobile passes)\n' +
+    '  4. Company Phone 1       (skips row if Mobile or Phone 1 passes)\n' +
+    '  5. Company Phone 2       (skips row if any above passes)\n\n' +
+    'Status markers:\n' +
+    '  SKIP     = higher-priority phone already passed\n' +
+    '  NO_EMAIL = Email 1 not valid — phone validation skipped\n\n' +
+    'Edit PHONE_VALIDATION_CONFIG in the script editor to change any setting.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
-/**
- * Shows execution logs for phone validation
- */
 function showValidationLogs() {
   const logs = Logger.getLog();
-  const ui = SpreadsheetApp.getUi();
-  
-  if (logs) {
-    ui.alert('Phone Validation Logs', logs, ui.ButtonSet.OK);
-  } else {
-    ui.alert('Phone Validation Logs', 'No logs available. Run the validation first.', ui.ButtonSet.OK);
-  }
-}
-
-// =============================================================================
-// INDIVIDUAL COLUMN VALIDATION FUNCTIONS (Menu Items)
-// =============================================================================
-
-/**
- * Validates Contact Phone 1 column (rows 2-6 in test mode)
- */
-function validateContactPhone1() {
-  validatePhoneColumn_Single('Contact Phone 1');
-}
-
-/**
- * Validates Company Phone 1 column (rows 2-6 in test mode)
- */
-function validateCompanyPhone1() {
-  validatePhoneColumn_Single('Company Phone 1');
-}
-
-/**
- * Validates Company Phone 2 column (rows 2-6 in test mode)
- */
-function validateCompanyPhone2() {
-  validatePhoneColumn_Single('Company Phone 2');
-}
-
-/**
- * Validates Contact Mobile Phone column (rows 2-6 in test mode)
- */
-function validateContactMobilePhone() {
-  validatePhoneColumn_Single('Contact Mobile Phone');
+  SpreadsheetApp.getUi().alert(
+    '📋 Phone Validation Logs',
+    logs || 'No logs available. Run a validation first.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 // =============================================================================
