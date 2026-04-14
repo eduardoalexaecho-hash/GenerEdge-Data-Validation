@@ -1070,6 +1070,7 @@ function onOpen() {
     // CRM Ready
     .addSubMenu(ui.createMenu('🎯 CRM Ready')
       .addItem('📞 Generate CRM Callers Ready',  'generateCRMCallersReady')
+      .addItem('📋 Generate CRM Ready',          'generateCRMReady')
       .addSeparator()
       .addItem('📊 Compare with CRM Ready',      'compareWithCRMReady')
       .addItem('ℹ️ Comparison Info',             'showComparisonInfo')
