@@ -721,6 +721,170 @@ function writeExcludedSheet_(ss, excluded, colMap) {
   Logger.log(`Excluded Contacts: ${excluded.length} rows written`);
 }
 
+
+// =============================================================================
+// CRM READY — NO VALIDATION REQUIRED
+// =============================================================================
+
+/**
+ * Generates a simple "CRM Ready" sheet from the active sheet.
+ * Does NOT require any validation (_Status columns).
+ * Takes Email 1 and Contact Mobile Phone directly, no filtering.
+ * Same output columns as CRM Callers Ready.
+ *
+ * Output tab: "CRM Ready"
+ * MENU: 🔧 Data Tools → 🎯 CRM Ready → 📋 Generate CRM Ready
+ */
+function generateCRMReady() {
+  const startTime = new Date();
+
+  try {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getActiveSheet();
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+
+    if (lastRow < 2) {
+      SpreadsheetApp.getUi().alert('⚠️ No Data', 'No data rows found in the active sheet.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    const allData = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+    const headers = allData[0].map(h => h.toString().trim());
+
+    // ── Find column indices ───────────────────────────────────────────────────
+    const colIdx = name => headers.findIndex(h => h.toLowerCase() === name.toLowerCase());
+
+    const firstNameIdx      = colIdx('First Name');
+    const lastNameIdx       = colIdx('Last Name');
+    const fullNameIdx       = colIdx('Contact Full Name');
+    const organizationIdx   = colIdx('Organization');
+    const email1Idx         = colIdx('Email 1');
+    const cityIdx           = colIdx('Company City');
+    const stateIdx          = colIdx('Company State');
+    const address1Idx       = colIdx('Address 1');
+    const address2Idx       = colIdx('Address 2');
+    const countyIdx         = colIdx('County');
+    const zipIdx            = colIdx('Zip');
+    const genderIdx         = colIdx('Gender');
+    const raceIdx           = colIdx('Race/Ethnicity');
+    const industryIdx       = colIdx('Industry');
+
+    // Phone fallback chain — same order as CRM Callers Ready, first non-empty wins
+    const phoneChainIndices = [
+      colIdx('Contact Mobile Phone'),
+      colIdx('Contact Phone 1'),
+      colIdx('Company Phone 1'),
+      colIdx('Company Phone 2')
+    ].filter(i => i !== -1);
+
+    if (organizationIdx === -1) {
+      SpreadsheetApp.getUi().alert('⚠️ Missing Column',
+        '"Organization" column not found in the active sheet.',
+        SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    // ── Build output rows ─────────────────────────────────────────────────────
+    const outputRows = [];
+
+    for (let i = 1; i < allData.length; i++) {
+      const row = allData[i];
+
+      const get = idx => idx !== -1 && row[idx] !== undefined ? row[idx].toString().trim() : '';
+
+      // Build contact_full_name — use source column or combine first + last
+      let contactFullName = get(fullNameIdx);
+      const firstName     = get(firstNameIdx);
+      const lastName      = get(lastNameIdx);
+      if (!contactFullName) {
+        contactFullName = [firstName, lastName].filter(Boolean).join(' ');
+      }
+
+      // Phone fallback — first non-empty value in chain wins
+      const phone = phoneChainIndices.reduce((found, idx) => {
+        if (found) return found;
+        const val = get(idx);
+        return val || '';
+      }, '');
+
+      outputRows.push({
+        first_name:        firstName || contactFullName.split(' ')[0] || '',
+        last_name:         lastName  || contactFullName.split(' ').slice(1).join(' ') || '',
+        contact_full_name: contactFullName,
+        organization:      get(organizationIdx),
+        email:             get(email1Idx),
+        phone,
+        city:              get(cityIdx),
+        state:             get(stateIdx),
+        address_1:         get(address1Idx),
+        address_2:         get(address2Idx),
+        county:            get(countyIdx),
+        zip:               get(zipIdx),
+        gender:            get(genderIdx),
+        race_ethnicity:    get(raceIdx),
+        industry:          get(industryIdx)
+      });
+    }
+
+    // ── Write output sheet ────────────────────────────────────────────────────
+    const OUTPUT_SHEET_NAME = 'CRM Ready';
+    const existing = ss.getSheetByName(OUTPUT_SHEET_NAME);
+    if (existing) ss.deleteSheet(existing);
+    const outputSheet = ss.insertSheet(OUTPUT_SHEET_NAME);
+
+    const outputColumns = CALLERS_CONFIG.OUTPUT_COLUMNS; // same order as CRM Callers Ready
+
+    // Header row
+    outputSheet.getRange(1, 1, 1, outputColumns.length)
+      .setValues([outputColumns])
+      .setBackground('#0f9d58')   // Green — distinct from CRM Callers Ready blue
+      .setFontColor('#ffffff')
+      .setFontWeight('bold')
+      .setHorizontalAlignment('center');
+
+    // Data rows
+    if (outputRows.length > 0) {
+      const data = outputRows.map(r => outputColumns.map(col => r[col] || ''));
+      outputSheet.getRange(2, 1, data.length, outputColumns.length).setValues(data);
+    }
+
+    outputSheet.setFrozenRows(1);
+    for (let c = 1; c <= outputColumns.length; c++) outputSheet.autoResizeColumn(c);
+
+    const duration = ((new Date() - startTime) / 1000).toFixed(1);
+    Logger.log(`CRM Ready: ${outputRows.length} rows written in ${duration}s`);
+
+    SpreadsheetApp.getUi().alert(
+      '✅ CRM Ready Complete',
+      `📊 Results:
+
+` +
+      `  Rows written:   ${outputRows.length}
+` +
+      `  Output tab:     "${OUTPUT_SHEET_NAME}"
+` +
+      `  Duration:       ${duration}s
+
+` +
+      `Note: No validation filtering applied.
+` +
+      `Email 1 and Contact Mobile Phone taken as-is.`,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+
+    ss.setActiveSheet(outputSheet);
+
+  } catch (error) {
+    Logger.log('ERROR: ' + error.toString());
+    SpreadsheetApp.getUi().alert('❌ Error',
+      'CRM Ready failed:\n\n' + error.toString(),
+      SpreadsheetApp.getUi().ButtonSet.OK);
+    throw error;
+  }
+}
+
 // =============================================================================
 // END OF SCRIPT
 // =============================================================================
